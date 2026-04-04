@@ -3012,6 +3012,7 @@ class ServerArgs:
         if self.speculative_algorithm == "NEXTN":
             self.speculative_algorithm = "EAGLE"
 
+        is_mtp = False
         if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
             if self.speculative_algorithm == "STANDALONE" and self.enable_dp_attention:
                 # TODO: support dp attention for standalone speculative decoding
@@ -3067,6 +3068,7 @@ class ServerArgs:
                 "MistralLarge3ForCausalLM",
                 "PixtralForConditionalGeneration",
             ]:
+                is_mtp = True
                 if self.speculative_draft_model_path is None:
                     self.speculative_draft_model_path = self.model_path
                     self.speculative_draft_model_revision = self.revision
@@ -3190,6 +3192,7 @@ class ServerArgs:
         if (
             self.speculative_algorithm is not None
             and self.speculative_draft_attention_backend is None
+            and not is_mtp
         ):
             MLA_ONLY_BACKENDS = {"flashmla", "cutlass_mla", "trtllm_mla"}
             effective_backends = {
