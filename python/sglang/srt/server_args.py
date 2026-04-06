@@ -2217,7 +2217,6 @@ class ServerArgs:
                 "flashinfer" if is_flashinfer_available() else "pytorch"
             )
 
-    
     def _get_default_draft_attn_backend(self) -> str:
         """
         Pick the best MHA attention backend for the draft model on current hardware.
@@ -2228,7 +2227,7 @@ class ServerArgs:
         """
         topk = self.speculative_eagle_topk
         page_size = self.page_size
-        
+
         assert topk is not None and page_size is not None
 
         if is_hopper_with_cuda_12_3() and topk == 1 and page_size == 1:
@@ -2241,7 +2240,6 @@ class ServerArgs:
             return "torch_native"
         else:
             return "flashinfer" if is_flashinfer_available() else "triton"
-
 
     def _get_default_attn_backend(self, use_mla_backend: bool, model_config):
         """
