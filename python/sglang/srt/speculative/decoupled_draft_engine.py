@@ -172,10 +172,12 @@ class _RoundCarriers:
         # All carrier rows sharing the committed prefix (delta broadcast).
         self.all_rows = torch.cat([glue_rows, branch_rows], dim=1)  # [bs, K+R]
         # Combined scatter template: glue triangle (row g needs c_1..c_g's
-        # slots at [L:L+g]) + branch case prefixes (row (c, f) needs
-        # c_1..c_c's slots at [L:L+c]). Entry j's value is backbone slot j.
-        tri_g = [g for g in range(num_steps) for j in range(g)]
-        tri_j = [j for g in range(num_steps) for j in range(g)]
+        # slots at [L:L+g] INCLUSIVE -- fa3 extend reads the current token's
+        # own K/V through the page table too) + branch case prefixes (row
+        # (c, f) needs c_1..c_c's slots at [L:L+c); its own entry is written
+        # by alloc_for_decode). Entry j's value is backbone slot j.
+        tri_g = [g for g in range(num_steps) for j in range(g + 1)]
+        tri_j = [j for g in range(num_steps) for j in range(g + 1)]
         br_r = [
             c * fanout + f
             for c in range(num_cases)
