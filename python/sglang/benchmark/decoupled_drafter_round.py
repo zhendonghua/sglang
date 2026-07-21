@@ -142,9 +142,11 @@ def _run_rounds(
 ) -> list[float]:
     round_ms = []
     for r in range(rounds):
-        for key in keys:
+        for i, key in enumerate(keys):
             if key in last_units:
-                force_miss = miss_every > 0 and (round_idx0 + r) % miss_every == 0
+                # Stagger misses across seats so bs>1 rounds exercise MIXED
+                # fast/slow subrounds, not just all-miss rounds.
+                force_miss = miss_every > 0 and (round_idx0 + r + i) % miss_every == 0
                 delta = sims[key].next_delta(last_units[key], force_miss=force_miss)
                 engine.apply_commit(key, delta)
             # else: first round; the opened prompt is the pending delta.
