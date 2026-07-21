@@ -206,32 +206,31 @@ def _compare_engines(
             units[name] = packed["units_device"][0].cpu().tolist()
         if units["fast"] != units["slow"]:
             mismatch_rounds += 1
-            guess_cols = {
-                name: [u[c][0][0] for c in range(len(u))] for name, u in units.items()
-            }
-            logger.info(
-                "round %d MISMATCH paths=%s lens=%s guess_col fast=%s slow=%s",
-                r,
-                paths,
-                lens,
-                guess_cols["fast"],
-                guess_cols["slow"],
-            )
+            diffs = []
             for case, (uf_row, us_row) in enumerate(zip(units["fast"], units["slow"])):
                 for f, (uf, us) in enumerate(zip(uf_row, us_row)):
                     if uf != us:
-                        logger.info(
-                            "round %d first diff case=%d f=%d fast=%s slow=%s",
-                            r,
-                            case,
-                            f,
-                            uf,
-                            us,
+                        first_pos = next(
+                            p for p, (a, b) in enumerate(zip(uf, us)) if a != b
                         )
-                        break
-                else:
-                    continue
-                break
+                        diffs.append((case, f, first_pos))
+            logger.info(
+                "round %d MISMATCH paths=%s diff_units=%d/%d at(case,f,pos)=%s",
+                r,
+                paths,
+                len(diffs),
+                sum(len(row) for row in units["fast"]),
+                diffs[:8],
+            )
+            case, f, _ = diffs[0]
+            logger.info(
+                "round %d first diff case=%d f=%d fast=%s slow=%s",
+                r,
+                case,
+                f,
+                units["fast"][case][f],
+                units["slow"][case][f],
+            )
         force_miss = args.miss_every > 0 and r % args.miss_every == 0
         # Drive both engines from the SLOW engine's block (ground truth).
         delta = sim.next_delta(units["slow"], force_miss=force_miss)
