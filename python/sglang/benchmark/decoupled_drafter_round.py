@@ -53,6 +53,18 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--disable-cuda-graph", action="store_true")
     parser.add_argument(
+        "--context-length",
+        type=int,
+        default=None,
+        help="Forwarded to ServerArgs (bounds fa3's static page-table width).",
+    )
+    parser.add_argument(
+        "--cuda-graph-backend-prefill",
+        type=str,
+        default=None,
+        help="Forwarded to ServerArgs (e.g. 'full' / 'tc_piecewise').",
+    )
+    parser.add_argument(
         "--profile",
         action="store_true",
         help="Per-phase breakdown via SGLANG_DEBUG_DECOUPLED_DRAFT_PROFILE "
@@ -99,6 +111,12 @@ def main() -> None:
     )
     if args.attention_backend is not None:
         server_args_kwargs["attention_backend"] = args.attention_backend
+    if args.context_length is not None:
+        server_args_kwargs["context_length"] = args.context_length
+    if args.cuda_graph_backend_prefill is not None:
+        server_args_kwargs["cuda_graph_backend_prefill"] = (
+            args.cuda_graph_backend_prefill
+        )
     server_args = ServerArgs(**server_args_kwargs)
     port_args = PortArgs.init_new(server_args)
     bench_runner, _tokenizer = load_model(server_args, port_args, 0, 0)
