@@ -370,6 +370,7 @@ class EnumDraftEngine:
         forward_batch = ForwardBatch.init_new(
             batch, self.model_runner, return_hidden_states_before_norm=False
         )
+        self.profiler.mark(f"{tag}_fb")
         logits_output = self.model_runner.forward(forward_batch).logits_output
         self.profiler.mark(f"{tag}_fwd")
         return logits_output.next_token_logits
@@ -383,6 +384,7 @@ class EnumDraftEngine:
         forward_batch = ForwardBatch.init_new(
             batch, self.model_runner, return_hidden_states_before_norm=False
         )
+        self.profiler.mark(f"{tag}_step_fb")
         logits_output = self.model_runner.forward(forward_batch).logits_output
         self.profiler.mark(f"{tag}_step_fwd")
         return logits_output.next_token_logits, batch.out_cache_loc

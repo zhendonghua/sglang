@@ -104,6 +104,11 @@ def main() -> None:
     bench_runner, _tokenizer = load_model(server_args, port_args, 0, 0)
     model_runner = bench_runner.torch_runner
     vocab_size = model_runner.model_config.vocab_size
+    logger.info(
+        "attention_backend=%s cuda_graph_bs_decode=%s",
+        model_runner.server_args.attention_backend,
+        model_runner.server_args.cuda_graph_bs_decode,
+    )
 
     engine = EnumDraftEngine(
         model_runner=model_runner,
