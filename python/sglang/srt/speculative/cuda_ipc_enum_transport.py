@@ -181,50 +181,72 @@ class CudaIpcEnumBlockReader:
         self.device = device
         name = _shm_name(endpoint)
         deadline = time.monotonic() + attach_timeout_s
-        shm: Optional[shared_memory.SharedMemory] = None
+        last_error: Optional[Exception] = None
         while time.monotonic() < deadline:
             try:
-                shm = shared_memory.SharedMemory(name=name)
-                header = np.ndarray((_HEADER_INT64S,), dtype=np.int64, buffer=shm.buf)
-                if header[0] == _MAGIC:
-                    break
-                shm.close()
-                shm = None
-            except FileNotFoundError:
-                pass
+                if self._try_attach(name):
+                    return
+            except Exception as exc:  # noqa: BLE001
+                # A stale segment from a dead producer carries a valid magic
+                # but a dead CUDA handle (opening it raises "invalid resource
+                # handle"); the live producer replaces the segment at startup,
+                # so keep re-opening the shm by name until its handle opens.
+                last_error = exc
             time.sleep(0.2)
-        if shm is None:
-            raise TimeoutError(
-                f"decoupled enum IPC pool did not appear within "
-                f"{attach_timeout_s}s (shm name {name}); is the drafter up "
-                f"with --decoupled-spec-data-transport cuda_ipc?"
-            )
-        self._shm = shm
-        header = np.ndarray((_HEADER_INT64S,), dtype=np.int64, buffer=shm.buf)
-        self.num_slots = int(header[2])
-        self.max_rows = int(header[3])
-        self.row_width = int(header[4])
-        handle = pickle.loads(
-            bytes(
-                self._shm.buf[_HEADER_INT64S * 8 : _HEADER_INT64S * 8 + _HANDLE_BYTES]
-            )
+        raise TimeoutError(
+            f"decoupled enum IPC pool did not attach within {attach_timeout_s}s "
+            f"(shm name {name}; last error: {last_error!r}); is the drafter up "
+            f"with --decoupled-spec-data-transport cuda_ipc?"
         )
-        # Redirect handle[0] to the consumer's device so _new_shared_cuda's
-        # CUDAGuard stays there; peer access handles the cross-GPU open
-        # (utils/cuda_ipc_transport_utils.py idiom).
-        local_index = torch.device(device).index or 0
-        redirected_handle = (local_index,) + tuple(handle)[1:]
-        with torch.cuda.device(local_index):
-            storage = torch.UntypedStorage._new_shared_cuda(*redirected_handle)
-            flat = torch.empty(0, dtype=torch.int64, device=f"cuda:{local_index}")
-            flat.set_(
-                storage,
-                storage_offset=0,
-                size=(self.num_slots * self.max_rows * self.row_width,),
-                stride=(1,),
+
+    def _try_attach(self, name: str) -> bool:
+        """One attach attempt against a FRESH shm open; False = not there yet.
+
+        A pre-recreation mapping must never be reused: after the producer
+        unlinks + recreates the segment, an already-open fd still sees the old
+        (dead) memory, so every retry re-opens by name.
+        """
+        try:
+            shm = shared_memory.SharedMemory(name=name)
+        except FileNotFoundError:
+            return False
+        try:
+            header = np.ndarray((_HEADER_INT64S,), dtype=np.int64, buffer=shm.buf)
+            if header[0] != _MAGIC:
+                shm.close()
+                return False
+            num_slots = int(header[2])
+            max_rows = int(header[3])
+            row_width = int(header[4])
+            handle = pickle.loads(
+                bytes(shm.buf[_HEADER_INT64S * 8 : _HEADER_INT64S * 8 + _HANDLE_BYTES])
             )
-        self.pool = flat.view(self.num_slots, self.max_rows, self.row_width)
-        self.flags = _flags_view(self._shm, self.num_slots)
+            # Redirect handle[0] to the consumer's device so _new_shared_cuda's
+            # CUDAGuard stays there; peer access handles the cross-GPU open
+            # (utils/cuda_ipc_transport_utils.py idiom).
+            local_index = torch.device(self.device).index or 0
+            redirected_handle = (local_index,) + tuple(handle)[1:]
+            with torch.cuda.device(local_index):
+                # Force the local context before the IPC open.
+                torch.zeros(1, device=f"cuda:{local_index}")
+                storage = torch.UntypedStorage._new_shared_cuda(*redirected_handle)
+                flat = torch.empty(0, dtype=torch.int64, device=f"cuda:{local_index}")
+                flat.set_(
+                    storage,
+                    storage_offset=0,
+                    size=(num_slots * max_rows * row_width,),
+                    stride=(1,),
+                )
+        except Exception:
+            shm.close()
+            raise
+        self._shm = shm
+        self.num_slots = num_slots
+        self.max_rows = max_rows
+        self.row_width = row_width
+        self.pool = flat.view(num_slots, max_rows, row_width)
+        self.flags = _flags_view(shm, num_slots)
+        return True
 
     def poll(self) -> Optional[tuple[int, torch.Tensor]]:
         """Return (slot, rows [B, row_width] mapped GPU view) for one landed
