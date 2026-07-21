@@ -354,6 +354,10 @@ class EnumDraftEngine:
         )
         scratch_batches.append(advance_batch)
         node0_logits = self._forward(advance_batch, tag="advance")
+        # Graph-runner logits live in a static output buffer that the NEXT
+        # forward overwrites -- consume them (topk) before the glue forward,
+        # exactly like the slow path consumes each step's logits immediately.
+        node0_guesses = torch.topk(node0_logits, fanout, dim=-1).indices  # [bs, F]
         self._absorb_advance_slots(states, advance_slots)
 
         # -- Carrier pool rows: broadcast the committed delta, then scatter
@@ -388,14 +392,10 @@ class EnumDraftEngine:
         glue_logits = self._glue_forward(
             states=states, chains=chains, backbone_slots=backbone_slots
         )
-        node_logits_all = torch.cat(
-            [
-                node0_logits.view(bs, 1, -1),
-                glue_logits.view(bs, num_steps, -1),
-            ],
-            dim=1,
-        )
-        guesses_stack = torch.topk(node_logits_all, fanout, dim=-1).indices
+        glue_guesses = torch.topk(
+            glue_logits.view(bs, num_steps, -1), fanout, dim=-1
+        ).indices  # [bs, K, F]
+        guesses_stack = torch.cat([node0_guesses.unsqueeze(1), glue_guesses], dim=1)
 
         # -- Branch chains: K decode replays on the retained carrier batch.
         chain_steps = self._branch_decode_chain(
