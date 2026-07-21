@@ -201,6 +201,7 @@ class EnumDraftEngine:
         model_runner: ModelRunner,
         num_steps: int,
         fanout: int,
+        enable_glue_fast_path: bool = True,
     ) -> None:
         self.model_runner = model_runner
         self.num_steps = int(num_steps)
@@ -216,6 +217,7 @@ class EnumDraftEngine:
         self._sampling_params = SamplingParams(temperature=0, max_new_tokens=1 << 30)
         self._states: dict[DraftReqKey, _DraftReqState] = {}
         self._carriers: Optional[_RoundCarriers] = None
+        self._enable_glue_fast_path = bool(enable_glue_fast_path)
         self.hit_ct = 0
         self.miss_ct = 0
         self.profiler = _RoundProfiler(
@@ -304,6 +306,8 @@ class EnumDraftEngine:
         """Match every seat's pending delta against its last block; returns
         the winning (accept_case, fanout_index) per seat, or None if any seat
         misses (which routes the whole round to the slow path)."""
+        if not self._enable_glue_fast_path:
+            return None
         if self._carriers is None or self._carriers.keys != tuple(keys):
             return None
         selections: list[tuple[int, int]] = []
@@ -647,6 +651,8 @@ class EnumDraftEngine:
         """Retain this slow round's branch batch + a freshly built glue batch
         as the fast path's carriers (their pool rows persist; KV slots stay
         per-round scratch)."""
+        if not self._enable_glue_fast_path:
+            return
         self._evict_carriers()
         # The branch batch's pool rows survive the round; its KV slots are
         # already tracked in scratch_slots and freed as usual.

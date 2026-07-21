@@ -85,6 +85,12 @@ def _parse_args() -> argparse.Namespace:
         help="Wrap 3 post-warmup rounds in torch.profiler and export a chrome "
         "trace to this path; also prints the top ops by CPU time.",
     )
+    parser.add_argument(
+        "--compare",
+        action="store_true",
+        help="Correctness mode: drive a fast-path engine and a slow-path "
+        "engine with identical commits and diff their blocks each round.",
+    )
     return parser.parse_args()
 
 
@@ -153,6 +159,78 @@ def _run_rounds(
     return round_ms
 
 
+def _compare_engines(
+    *,
+    model_runner,
+    vocab_size: int,
+    args: argparse.Namespace,
+) -> None:
+    """Drive a fast-path and a slow-path engine with identical commits;
+    report the first block divergence per round (unit-level diff)."""
+    engines = {
+        "fast": EnumDraftEngine(
+            model_runner=model_runner,
+            num_steps=args.num_steps,
+            fanout=args.fanout,
+        ),
+        "slow": EnumDraftEngine(
+            model_runner=model_runner,
+            num_steps=args.num_steps,
+            fanout=args.fanout,
+            enable_glue_fast_path=False,
+        ),
+    }
+    rng = random.Random(42)
+    prompt = [rng.randrange(vocab_size) for _ in range(args.prompt_len)]
+    key = DraftReqKey(src_verifier_rank=0, request_id="cmp-0")
+    for engine in engines.values():
+        engine.open(
+            key, req_pool_idx=0, prompt_tokens=list(prompt), committed_outputs=[]
+        )
+    sim = _VerifierSim(
+        accept_len=args.accept_len, fanout=args.fanout, rng=rng, vocab_size=vocab_size
+    )
+    delta: Optional[list[int]] = None
+    mismatch_rounds = 0
+    for r in range(args.rounds):
+        units = {}
+        for name, engine in engines.items():
+            if delta is not None:
+                engine.apply_commit(key, delta)
+            packed = engine.draft_round([key])
+            units[name] = packed["units_device"][0].cpu().tolist()
+        if units["fast"] != units["slow"]:
+            mismatch_rounds += 1
+            for case, (uf_row, us_row) in enumerate(zip(units["fast"], units["slow"])):
+                for f, (uf, us) in enumerate(zip(uf_row, us_row)):
+                    if uf != us:
+                        logger.info(
+                            "round %d MISMATCH case=%d f=%d fast=%s slow=%s",
+                            r,
+                            case,
+                            f,
+                            uf,
+                            us,
+                        )
+                        break
+                else:
+                    continue
+                break
+        force_miss = args.miss_every > 0 and r % args.miss_every == 0
+        # Drive both engines from the SLOW engine's block (ground truth).
+        delta = sim.next_delta(units["slow"], force_miss=force_miss)
+    logger.info(
+        "compare done: rounds=%d mismatch_rounds=%d fast(hit=%d,miss=%d) "
+        "slow(hit=%d,miss=%d)",
+        args.rounds,
+        mismatch_rounds,
+        engines["fast"].hit_ct,
+        engines["fast"].miss_ct,
+        engines["slow"].hit_ct,
+        engines["slow"].miss_ct,
+    )
+
+
 def main() -> None:
     args = _parse_args()
     if args.profile:
@@ -185,6 +263,10 @@ def main() -> None:
         model_runner.server_args.attention_backend,
         model_runner.server_args.cuda_graph_bs_decode,
     )
+
+    if args.compare:
+        _compare_engines(model_runner=model_runner, vocab_size=vocab_size, args=args)
+        return
 
     engine = EnumDraftEngine(
         model_runner=model_runner,
