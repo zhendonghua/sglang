@@ -37,6 +37,10 @@ logger = logging.getLogger(__name__)
 
 _IDLE_WAIT_S = 0.0005
 
+# CUDA IPC slot capacity in block rows; bounds the verifier batch size a
+# single push can carry (the verifier's default running cap is far below it).
+IPC_POOL_MAX_ROWS = 256
+
 
 class DecoupledDraftManager:
     """Drafter engine driver: controls in, enumeration blocks out."""
@@ -48,6 +52,7 @@ class DecoupledDraftManager:
         model_runner: ModelRunner,
         num_steps: int,
         fanout: int,
+        data_transport: str = "zmq",
     ) -> None:
         import zmq
 
@@ -70,6 +75,22 @@ class DecoupledDraftManager:
         )
         self.ipc_thread.start()
 
+        self.ipc_block_pool = None
+        if data_transport == "cuda_ipc":
+            from sglang.srt.speculative.cuda_ipc_enum_transport import (
+                CudaIpcEnumBlockPool,
+            )
+
+            unit_width = self.num_steps + 1
+            self.ipc_block_pool = CudaIpcEnumBlockPool(
+                device=model_runner.device,
+                # Both sides derive the shm rendezvous name from the drafter's
+                # bind endpoint.
+                endpoint=ipc_config.bind_endpoint,
+                max_rows=IPC_POOL_MAX_ROWS,
+                row_width=2 + unit_width * self.fanout * unit_width,
+            )
+
     def run_loop(self) -> None:
         """The drafter scheduler's event loop (never returns)."""
         logger.info(
@@ -89,7 +110,13 @@ class DecoupledDraftManager:
             if ready.is_empty():
                 time.sleep(_IDLE_WAIT_S)
                 continue
-            self._apply_controls_and_draft(ready)
+            try:
+                self._apply_controls_and_draft(ready)
+            except Exception:
+                # A bad round must not kill the drafter for every request; the
+                # affected verifier rounds simply fall back. TODO(5c-class):
+                # quarantine the offending request instead of best-effort.
+                logger.exception("decoupled drafter round failed; controls dropped")
 
     def _apply_controls_and_draft(self, ready) -> None:
         for draft_key in ready.close_keys:
@@ -118,6 +145,15 @@ class DecoupledDraftManager:
             packed = self.engine.draft_round(draft_keys)
             if packed is None:
                 continue
+            if self.ipc_block_pool is not None:
+                # CUDA IPC data plane: D2D into the shared pool; the shm flag
+                # bump after the device sync is the arrival signal.
+                self.ipc_block_pool.push(
+                    pool_indices=packed["pool_indices"],
+                    base_committed_lens=packed["base_committed_lens"],
+                    units=packed["units_device"],
+                )
+                continue
             self.ipc_thread.submit_draft_results(
                 DraftEnumerationBufferBatch(
                     src_drafter_rank=self.ipc_config.rank,
@@ -126,7 +162,7 @@ class DecoupledDraftManager:
                     fanout=self.fanout,
                     pool_indices=packed["pool_indices"],
                     base_committed_lens=packed["base_committed_lens"],
-                    tokens=packed["tokens"],
+                    tokens=tuple(packed["units_device"].to("cpu").reshape(-1).tolist()),
                 )
             )
 

@@ -176,6 +176,33 @@ class DecoupledEnumBuffer:
             block.base_committed_lens, dtype=torch.int64, device=self.device
         )
 
+        self._scatter_generation(pool_indices, rows, base_committed_lens)
+
+    def land_rows_device(
+        self,
+        pool_indices: torch.Tensor,
+        base_committed_lens: torch.Tensor,
+        rows: torch.Tensor,
+    ) -> None:
+        """Device-side landing for the CUDA IPC data plane: everything already
+        lives on this GPU (mapped from the drafter's pool), so this is only the
+        seat-range guard + the generation scatter. The caller (the IPC poll
+        loop) validated shapes from its small host mirror.
+        """
+        if pool_indices.numel() == 0:
+            return
+        self._scatter_generation(
+            pool_indices.to(torch.int64),
+            rows.to(torch.int64),
+            base_committed_lens.to(torch.int64),
+        )
+
+    def _scatter_generation(
+        self,
+        pool_indices: torch.Tensor,
+        rows: torch.Tensor,
+        base_committed_lens: torch.Tensor,
+    ) -> None:
         slot = self._write_slot
         # Write the generation NOT written last, then mark it newest: the
         # previous block survives exactly one more push (see gen_count above).

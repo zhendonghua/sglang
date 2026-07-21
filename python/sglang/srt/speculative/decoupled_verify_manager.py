@@ -29,6 +29,8 @@ import threading
 import time
 from typing import TYPE_CHECKING, Optional
 
+import torch
+
 from sglang.srt.environ import envs
 from sglang.srt.speculative.decoupled_scripted_drafter import ScriptedFakeDrafter
 from sglang.srt.speculative.decoupled_spec_io import (
@@ -72,8 +74,11 @@ class EnumArrivalBoard:
         self._stamps: dict[int, int] = {}
 
     def record(self, block: DraftEnumerationBufferBatch) -> None:
+        self.record_pairs(block.pool_indices, block.base_committed_lens)
+
+    def record_pairs(self, pool_indices: list[int], stamps: list[int]) -> None:
         with self._cond:
-            for pool_idx, stamp in zip(block.pool_indices, block.base_committed_lens):
+            for pool_idx, stamp in zip(pool_indices, stamps):
                 self._stamps[int(pool_idx)] = int(stamp)
             self._cond.notify_all()
 
@@ -119,6 +124,7 @@ class DecoupledVerifyManager:
         *,
         ipc_config: DecoupledSpecIpcConfig,
         verify_worker: VerifyWorker,
+        data_transport: str = "zmq",
     ) -> None:
         self.ipc_config = ipc_config
         self.verify_worker = verify_worker
@@ -151,6 +157,65 @@ class DecoupledVerifyManager:
             on_land=self.arrival_board.record,
         )
         self.ipc_thread.start()
+
+        self._ipc_poll_closed = threading.Event()
+        self._ipc_poll_thread: Optional[threading.Thread] = None
+        if data_transport == "cuda_ipc" and loopback_mode is None:
+            self._ipc_poll_thread = threading.Thread(
+                target=self._cuda_ipc_poll_loop,
+                name="sglang-decoupled-enum-ipc-poll",
+                daemon=True,
+            )
+            self._ipc_poll_thread.start()
+
+    def _cuda_ipc_poll_loop(self) -> None:
+        """Consume enumeration blocks from the drafter's CUDA IPC pool.
+
+        Attaches to the shm rendezvous (retrying until the drafter is up),
+        then polls the slot flags: mapped rows carry [pool_idx, stamp,
+        unit tokens ...], so landing is one device-side scatter; the tiny
+        host mirror (2 ints per row) feeds the seat-range guard and the
+        sync-mode arrival board.
+        """
+        from sglang.srt.speculative.cuda_ipc_enum_transport import (
+            CudaIpcEnumBlockReader,
+        )
+
+        try:
+            reader = CudaIpcEnumBlockReader(
+                device=self.verify_worker.device,
+                # The rendezvous name comes from the DRAFTER's bind endpoint,
+                # which is this verifier's (only) connect endpoint.
+                endpoint=self.ipc_config.connect_endpoints[0],
+            )
+        except TimeoutError:
+            logger.exception("decoupled enum IPC pool attach failed")
+            return
+        logger.info("decoupled enum IPC pool attached (cuda_ipc data plane)")
+        enum_buffer = self.verify_worker.enum_buffer
+        while not self._ipc_poll_closed.is_set():
+            polled = reader.poll()
+            if polled is None:
+                time.sleep(0.0002)
+                continue
+            slot, rows = polled
+            try:
+                meta = rows[:, :2].to("cpu")  # small D2H: [B, 2]
+                pool_indices = meta[:, 0].tolist()
+                stamps = meta[:, 1].tolist()
+                if any(p < 1 or p >= enum_buffer.seats for p in pool_indices):
+                    logger.error(
+                        "decoupled enum IPC block has out-of-range seats; dropped"
+                    )
+                else:
+                    enum_buffer.land_rows_device(rows[:, 0], rows[:, 1], rows[:, 2:])
+                    torch.cuda.synchronize(self.verify_worker.device)
+                    self.arrival_board.record_pairs(pool_indices, stamps)
+            except Exception:
+                logger.exception("decoupled enum IPC landing failed; block dropped")
+            finally:
+                reader.ack(slot)
+        reader.close()
 
     def _build_loopback(self, mode: str):
         """Single-process loopback: fake mesh + an in-process scripted drafter."""

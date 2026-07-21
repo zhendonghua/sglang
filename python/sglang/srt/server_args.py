@@ -1863,6 +1863,14 @@ class ServerArgs:
         "Role in decoupled speculative decoding: 'null' disables it, 'verifier' "
         "runs the target/verify half, 'drafter' runs the draft half.",
     ] = "null"
+    decoupled_spec_data_transport: A[
+        Literal["zmq", "cuda_ipc"],
+        "Data-plane transport for decoupled speculative decoding's enumeration "
+        "blocks: 'zmq' ships token ids over the control mesh; 'cuda_ipc' writes "
+        "them GPU-to-GPU through a CUDA IPC pool (NVLink peer access; both "
+        "engines must run on the same host). The control plane always uses ZMQ. "
+        "Set the same value on both engines.",
+    ] = "zmq"
     spec_trace_dir: A[
         Optional[str],
         "Directory to write decoupled speculative decoding trace files.",

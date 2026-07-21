@@ -145,17 +145,17 @@ class EnumDraftEngine:
         if not keys:
             return None
         states = [self._states[key] for key in keys]
-        scratch_rows: list[torch.Tensor] = []
+        scratch_batches: list[ScheduleBatch] = []
         scratch_slots: list[torch.Tensor] = []
         try:
-            return self._draft_round_inner(states, scratch_rows, scratch_slots)
+            return self._draft_round_inner(states, scratch_batches, scratch_slots)
         finally:
-            self._free_scratch(scratch_rows, scratch_slots)
+            self._free_scratch(scratch_batches, scratch_slots)
 
     def _draft_round_inner(
         self,
         states: list[_DraftReqState],
-        scratch_rows: list[torch.Tensor],
+        scratch_batches: list[ScheduleBatch],
         scratch_slots: list[torch.Tensor],
     ) -> dict:
         num_steps, fanout = self.num_steps, self.fanout
@@ -164,11 +164,11 @@ class EnumDraftEngine:
 
         # -- Phase 1: advance the committed prefix; last logits = node 0 ----
         node_logits: list[torch.Tensor] = []
-        advance_batch, advance_slots, advance_rows = self._extend_batch(
+        advance_batch, advance_slots = self._extend_batch(
             token_lists=[state.committed_tokens for state in states],
             prefix_slots=[state.committed_slots for state in states],
         )
-        scratch_rows.append(advance_rows)
+        scratch_batches.append(advance_batch)
         logits = self._forward(advance_batch)
         node_logits.append(logits)
         # Newly written KV joins the committed prefix (kept across rounds).
@@ -189,14 +189,14 @@ class EnumDraftEngine:
         backbone_tokens: list[torch.Tensor] = [guesses[0][:, 0]]
         backbone_slot_steps: list[torch.Tensor] = []
         if num_steps >= 1:
-            backbone_batch, first_slots, backbone_rows = self._extend_batch(
+            backbone_batch, first_slots = self._extend_batch(
                 token_lists=[
                     state.committed_tokens + [int(backbone_tokens[0][i])]
                     for i, state in enumerate(states)
                 ],
                 prefix_slots=[state.committed_slots for state in states],
             )
-            scratch_rows.append(backbone_rows)
+            scratch_batches.append(backbone_batch)
             scratch_slots.append(first_slots)
             backbone_slot_steps.append(first_slots)
             logits = self._forward(backbone_batch)
@@ -234,11 +234,11 @@ class EnumDraftEngine:
                     branch_prefix_slots.append(
                         torch.cat([state.committed_slots, backbone_slots_i[:case]])
                     )
-        branch_batch, branch_first_slots, branch_rows = self._extend_batch(
+        branch_batch, branch_first_slots = self._extend_batch(
             token_lists=branch_token_lists,
             prefix_slots=branch_prefix_slots,
         )
-        scratch_rows.append(branch_rows)
+        scratch_batches.append(branch_batch)
         scratch_slots.append(branch_first_slots)
         logits = self._forward(branch_batch)
         chain_steps: list[torch.Tensor] = [logits.argmax(dim=-1)]
@@ -248,15 +248,15 @@ class EnumDraftEngine:
             chain_steps.append(logits.argmax(dim=-1))
 
         # -- Phase 4: pack units [guess, chain_1..chain_K] ------------------
-        # chains: [bs * num_cases * F, K]
-        chains = torch.stack(chain_steps, dim=1).to("cpu")
-        chains = chains.view(bs, num_cases, fanout, num_steps)
-        guesses_col = guesses_stack.to("cpu").unsqueeze(-1)  # [bs, K+1, F, 1]
-        units = torch.cat([guesses_col, chains], dim=-1)  # [bs, K+1, F, K+1]
+        # chains: [bs * num_cases * F, K] -> [bs, K+1, F, K]; stays on device
+        # so the CUDA IPC data plane can push it D2D (the ZMQ path D2Hs it).
+        chains = torch.stack(chain_steps, dim=1).view(bs, num_cases, fanout, num_steps)
+        guesses_col = guesses_stack.unsqueeze(-1)  # [bs, K+1, F, 1]
+        units_device = torch.cat([guesses_col, chains], dim=-1)  # [bs, K+1, F, K+1]
         return {
             "pool_indices": [state.req_pool_idx for state in states],
             "base_committed_lens": [len(state.committed_tokens) for state in states],
-            "tokens": tuple(units.reshape(-1).tolist()),
+            "units_device": units_device,
         }
 
     # ------------------------------------------------------------------ #
@@ -268,10 +268,10 @@ class EnumDraftEngine:
         *,
         token_lists: list[list[int]],
         prefix_slots: list[torch.Tensor],
-    ) -> tuple[ScheduleBatch, torch.Tensor, torch.Tensor]:
+    ) -> tuple[ScheduleBatch, torch.Tensor]:
         """Extend each row's tokens beyond its (slot-shared) prefix.
 
-        Returns (batch, newly_allocated_slots_flat, req_pool_indices).
+        Returns (batch, newly_allocated_slots_flat).
         """
         reqs = []
         for i, tokens in enumerate(token_lists):
@@ -301,10 +301,12 @@ class EnumDraftEngine:
                 batch.device, non_blocking=True
             )
             batch.prefill_input_ids_cpu = None
-        return batch, batch.out_cache_loc, batch.req_pool_indices
+        return batch, batch.out_cache_loc
 
     def _forward(self, batch: ScheduleBatch) -> torch.Tensor:
-        forward_batch = ForwardBatch.init_new(batch, self.model_runner)
+        forward_batch = ForwardBatch.init_new(
+            batch, self.model_runner, return_hidden_states_before_norm=False
+        )
         logits_output = self.model_runner.forward(forward_batch).logits_output
         return logits_output.next_token_logits
 
@@ -313,16 +315,21 @@ class EnumDraftEngine:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch.input_ids = input_tokens.to(torch.int64)
         batch.prepare_for_decode()
-        forward_batch = ForwardBatch.init_new(batch, self.model_runner)
+        forward_batch = ForwardBatch.init_new(
+            batch, self.model_runner, return_hidden_states_before_norm=False
+        )
         logits_output = self.model_runner.forward(forward_batch).logits_output
         return logits_output.next_token_logits, batch.out_cache_loc
 
     def _free_scratch(
-        self, scratch_rows: list[torch.Tensor], scratch_slots: list[torch.Tensor]
+        self,
+        scratch_batches: list[ScheduleBatch],
+        scratch_slots: list[torch.Tensor],
     ) -> None:
         for slots in scratch_slots:
             if slots is not None and slots.numel() > 0:
                 self.model_runner.token_to_kv_pool_allocator.free(slots)
-        for rows in scratch_rows:
-            if rows is not None:
-                self.model_runner.req_to_token_pool.free(rows.tolist())
+        for batch in scratch_batches:
+            for req in batch.reqs:
+                if req.req_pool_idx is not None:
+                    self.model_runner.req_to_token_pool.free(req)

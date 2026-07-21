@@ -844,6 +844,7 @@ class Scheduler(
         self.decoupled_verify_manager = DecoupledVerifyManager(
             ipc_config=self.decoupled_spec_ipc_config,
             verify_worker=self.draft_worker,
+            data_transport=self.server_args.decoupled_spec_data_transport,
         )
 
     def maybe_init_decoupled_draft_manager(self):
@@ -860,6 +861,7 @@ class Scheduler(
             model_runner=self.tp_worker.model_runner,
             num_steps=self.server_args.speculative_num_steps,
             fanout=self.server_args.speculative_fanout,
+            data_transport=self.server_args.decoupled_spec_data_transport,
         )
 
     def init_target_memory_pool(self):
