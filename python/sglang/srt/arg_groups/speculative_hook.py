@@ -140,8 +140,159 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
         if server_args.speculative_adaptive:
             _init_adaptive_speculative_params(server_args)
 
+    # Decoupled spec is a role, not an algorithm. Run it before the per-algorithm
+    # dispatch so its role-level defaults win (see _handle_decoupled_spec).
+    if server_args.decoupled_spec_role != "null":
+        _handle_decoupled_spec(server_args)
+    elif server_args.speculative_fanout is not None:
+        raise ValueError(
+            "--speculative-fanout is only meaningful for decoupled speculative "
+            "decoding (it sizes the drafter's enumeration buffer); colocated "
+            "speculative decoding has no bonus fan-out."
+        )
+
     if algo is not None:
         algo.handle_server_args(server_args)
+
+
+def _handle_decoupled_spec(server_args: ServerArgs) -> None:
+    """Validate and normalize the decoupled-spec role (verifier / drafter) args.
+
+    Decoupled spec is a role orthogonal to the speculative algorithm. Runs before
+    the per-algorithm dispatch so the role's choices win: max_running_requests
+    defaults to 64 (vs the per-algo 48) and topk is pinned to 1 before an algorithm
+    handler could grow it. Algorithm handlers only fill unset values, so they keep
+    the role's choices.
+    """
+    is_drafter = server_args.is_decoupled_drafter()
+    role = "drafter" if is_drafter else "verifier"
+
+    # No data parallelism: the IPC mesh addresses one engine per role-rank; a
+    # second (dp) axis is not modeled in the rank/routing yet. To support it, key
+    # the mesh on (dp_rank, role_rank) and route each request by its dp owner.
+    if server_args.enable_dp_attention:
+        raise ValueError(
+            "decoupled speculative decoding does not support dp attention."
+        )
+    if server_args.dp_size != 1:
+        raise ValueError(
+            f"decoupled {role} requires dp_size == 1, got {server_args.dp_size}."
+        )
+    # The cross-process handshake is unvalidated against the PP microbatch loop.
+    if server_args.pp_size != 1:
+        raise ValueError(
+            f"decoupled {role} requires pp_size == 1, got {server_args.pp_size}."
+        )
+
+    if (
+        server_args.decoupled_spec_bind_endpoint is None
+        or server_args.decoupled_spec_connect_endpoints is None
+        or server_args.decoupled_spec_rank is None
+    ):
+        raise ValueError(
+            "--decoupled-spec-bind-endpoint, "
+            "--decoupled-spec-connect-endpoints, and "
+            "--decoupled-spec-rank are required for decoupled speculative decoding."
+        )
+    if int(server_args.decoupled_spec_rank) < 0:
+        raise ValueError("--decoupled-spec-rank must be non-negative.")
+
+    # page_size == 1: on each commit the drafter truncates its mirror request
+    # back to the committed prefix at token granularity before re-extending the
+    # next enumeration tree; page-aligned truncation isn't implemented.
+    if server_args.page_size is not None and server_args.page_size > 1:
+        raise ValueError(
+            "decoupled speculative decoding requires page_size == 1, "
+            f"got {server_args.page_size}."
+        )
+
+    # The drafter runs many perpetual requests, so default its running cap higher.
+    if server_args.max_running_requests is None:
+        server_args.max_running_requests = 64
+        logger.warning(
+            "max_running_requests is reset to 64 for decoupled speculative "
+            "decoding; override with --max-running-requests."
+        )
+
+    # Synchronous scheduler: the cross-process verify/commit handshake observes
+    # each step before starting the next, which the overlap pipeline may break.
+    # To support overlap, have the decoupled mixin relay per-step results as futures.
+    if not server_args.disable_overlap_schedule:
+        server_args.disable_overlap_schedule = True
+        logger.warning(
+            "Overlap scheduler is disabled for decoupled speculative decoding."
+        )
+
+    # Drafter only.
+    # - Radix cache off: the per-commit truncate-to-committed frees the discarded
+    #   enumeration tail with a direct token_to_kv_pool_allocator.free that isn't
+    #   radix ref-count aware, so a shared (COW) page could be freed wrongly. To
+    #   keep radix on, make the truncate free only the request's private tail
+    #   (never inserted in the tree) under lock_ref.
+    # - Mamba no_buffer: the extra_buffer cross-request SSM-state prefix cache isn't
+    #   validated for decoupled yet; set explicitly because the mamba handler ran
+    #   earlier in __post_init__, so disabling radix here doesn't undo it.
+    if is_drafter:
+        if not server_args.disable_radix_cache:
+            server_args.disable_radix_cache = True
+            logger.warning("Radix cache is disabled for the decoupled drafter.")
+        if server_args.mamba_radix_cache_strategy != "no_buffer":
+            server_args.mamba_radix_cache_strategy = "no_buffer"
+            logger.warning(
+                "mamba_radix_cache_strategy is set to 'no_buffer' for the "
+                "decoupled drafter."
+            )
+
+    # Mixed chunked prefill is unsupported by speculative decoding in general
+    # (check_server_args asserts it), not only decoupled.
+    if server_args.enable_mixed_chunk:
+        server_args.enable_mixed_chunk = False
+        logger.warning(
+            "Mixed chunked prefill is disabled for decoupled speculative decoding."
+        )
+
+    # Decoupled runs a real draft algorithm with an explicit speculation depth.
+    if server_args.speculative_algorithm is None:
+        raise ValueError(
+            "decoupled speculative decoding requires --speculative-algorithm "
+            "to be set (the draft technique the engines run, e.g. STANDALONE)."
+        )
+    if server_args.speculative_num_steps is None:
+        raise ValueError(
+            "decoupled speculative decoding requires speculative_num_steps to be set."
+        )
+
+    # topk == 1 (chain only): the IPC protocol streams linear tokens; tree drafting
+    # (topk > 1) needs a tree-structured protocol + tree verify. Pinned to 1.
+    if (
+        server_args.speculative_eagle_topk is not None
+        and server_args.speculative_eagle_topk != 1
+    ):
+        raise ValueError(
+            "decoupled speculative decoding only supports speculative_eagle_topk "
+            f"== 1, got {server_args.speculative_eagle_topk}."
+        )
+    server_args.speculative_eagle_topk = 1
+
+    # Chain speculation verifies num_steps + 1 tokens per window.
+    expected_num_draft_tokens = int(server_args.speculative_num_steps) + 1
+    if server_args.speculative_num_draft_tokens != expected_num_draft_tokens:
+        logger.warning(
+            "speculative_num_draft_tokens is adjusted to speculative_num_steps + 1 "
+            "for decoupled speculative decoding."
+        )
+        server_args.speculative_num_draft_tokens = expected_num_draft_tokens
+
+    # Bonus fan-out F: how many bonus-token guesses the drafter enumerates per
+    # accept case (the enumeration buffer is B x (K+1) x F x K). Only meaningful
+    # decoupled; the colocated guard lives in handle_speculative_decoding.
+    if server_args.speculative_fanout is None:
+        server_args.speculative_fanout = 4
+    if int(server_args.speculative_fanout) < 1:
+        raise ValueError(
+            "--speculative-fanout must be >= 1, "
+            f"got {server_args.speculative_fanout}."
+        )
 
 
 def _handle_dflash(server_args: ServerArgs) -> None:
