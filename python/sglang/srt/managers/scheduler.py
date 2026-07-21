@@ -438,8 +438,9 @@ class Scheduler(
         # Launch a model worker and draft model worker if using speculative decoding
         self.init_model_worker()
 
-        # Wire the decoupled-spec verifier IPC (needs the worker's enum buffer)
+        # Wire the decoupled-spec roles (both need the model worker's state)
         self.maybe_init_decoupled_verify_manager()
+        self.maybe_init_decoupled_draft_manager()
 
         if (t := envs.SGLANG_TEST_STUCK_SCHEDULER_INIT.get()) > 0:
             time.sleep(t)
@@ -843,6 +844,22 @@ class Scheduler(
         self.decoupled_verify_manager = DecoupledVerifyManager(
             ipc_config=self.decoupled_spec_ipc_config,
             verify_worker=self.draft_worker,
+        )
+
+    def maybe_init_decoupled_draft_manager(self):
+        if not self.server_args.is_decoupled_drafter():
+            self.decoupled_draft_manager = None
+            return
+
+        from sglang.srt.speculative.decoupled_draft_manager import (
+            DecoupledDraftManager,
+        )
+
+        self.decoupled_draft_manager = DecoupledDraftManager(
+            ipc_config=self.decoupled_spec_ipc_config,
+            model_runner=self.tp_worker.model_runner,
+            num_steps=self.server_args.speculative_num_steps,
+            fanout=self.server_args.speculative_fanout,
         )
 
     def init_target_memory_pool(self):
@@ -4521,6 +4538,11 @@ class Scheduler(
 def dispatch_event_loop(scheduler: Scheduler):
     # Dispatch to the appropriate event loop based on the disaggregation mode
     server_args = scheduler.server_args
+    if server_args.is_decoupled_drafter():
+        # The decoupled drafter serves no user requests: its event loop is the
+        # enumeration service (controls in, blocks out).
+        scheduler.decoupled_draft_manager.run_loop()
+        return
     disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
     if disaggregation_mode == DisaggregationMode.NULL:
         if scheduler.enable_pdmux:

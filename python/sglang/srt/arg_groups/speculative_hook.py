@@ -206,12 +206,17 @@ def _handle_decoupled_spec(server_args: ServerArgs) -> None:
             f"got {server_args.page_size}."
         )
 
-    # The drafter runs many perpetual requests, so default its running cap higher.
+    # The verifier runs many concurrent user requests, so default its running
+    # cap higher than the per-algo 48. The drafter needs far more req_to_token
+    # rows than live requests: each enumeration round holds transient scratch
+    # rows for the backbone and all (K+1) x F branch chains per request.
     if server_args.max_running_requests is None:
-        server_args.max_running_requests = 64
+        server_args.max_running_requests = 512 if is_drafter else 64
         logger.warning(
-            "max_running_requests is reset to 64 for decoupled speculative "
-            "decoding; override with --max-running-requests."
+            "max_running_requests is reset to %d for the decoupled %s; "
+            "override with --max-running-requests.",
+            server_args.max_running_requests,
+            role,
         )
 
     # Synchronous scheduler: the cross-process verify/commit handshake observes

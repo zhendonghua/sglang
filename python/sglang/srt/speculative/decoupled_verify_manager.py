@@ -276,3 +276,12 @@ class DecoupledVerifyManager:
         hit_list = hits.tolist()
         self.enum_round_ct += len(hit_list)
         self.enum_hit_ct += sum(hit_list)
+        if self.enum_round_ct and self.enum_round_ct % 200 < len(hit_list):
+            logger.info(
+                "decoupled enum select: hit_ct=%d round_ct=%d hit_rate=%.3f "
+                "sync_wait_timeout_ct=%d",
+                self.enum_hit_ct,
+                self.enum_round_ct,
+                self.enum_hit_ct / self.enum_round_ct,
+                self.sync_wait_timeout_ct,
+            )
