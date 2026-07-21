@@ -59,7 +59,9 @@ def get_draft_kv_pool(
 ):
     """Return the draft token-to-KV pool for the current draft worker,
     or None when no draft KV pool is available."""
-    if draft_worker is None or spec_algorithm.is_ngram():
+    # Verify-only spec workers (ngram, the decoupled verifier) drive no draft
+    # model: their nested draft_worker is None and there is no draft KV pool.
+    if draft_worker is None or draft_worker.draft_worker is None:
         return None
 
     # V2 workers nest the draft runner under `.draft_worker`.
