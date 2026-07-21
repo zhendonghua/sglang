@@ -74,6 +74,8 @@ class DecoupledDraftManager:
             transport=transport, drafter_rank=ipc_config.rank
         )
         self.ipc_thread.start()
+        self._round_ct = 0
+        self._round_time_s = 0.0
 
         self.ipc_block_pool = None
         if data_transport == "cuda_ipc":
@@ -142,7 +144,17 @@ class DecoupledDraftManager:
         for draft_key in touched:
             by_verifier.setdefault(draft_key.src_verifier_rank, []).append(draft_key)
         for verifier_rank, draft_keys in by_verifier.items():
+            round_start = time.monotonic()
             packed = self.engine.draft_round(draft_keys)
+            self._round_ct += 1
+            self._round_time_s += time.monotonic() - round_start
+            if self._round_ct % 200 == 0:
+                logger.info(
+                    "decoupled drafter rounds: ct=%d avg_ms=%.1f last_bs=%d",
+                    self._round_ct,
+                    1000.0 * self._round_time_s / self._round_ct,
+                    len(draft_keys),
+                )
             if packed is None:
                 continue
             if self.ipc_block_pool is not None:
