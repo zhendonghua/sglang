@@ -150,10 +150,13 @@ class DecoupledDraftManager:
             self._round_time_s += time.monotonic() - round_start
             if self._round_ct % 200 == 0:
                 logger.info(
-                    "decoupled drafter rounds: ct=%d avg_ms=%.1f last_bs=%d",
+                    "decoupled drafter rounds: ct=%d avg_ms=%.1f last_bs=%d "
+                    "fast=%d slow=%d",
                     self._round_ct,
                     1000.0 * self._round_time_s / self._round_ct,
                     len(draft_keys),
+                    self.engine.hit_ct,
+                    self.engine.miss_ct,
                 )
                 if self.engine.profiler.enabled:
                     logger.info(

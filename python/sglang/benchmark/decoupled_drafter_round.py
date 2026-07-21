@@ -16,6 +16,7 @@ import argparse
 import logging
 import random
 import time
+from typing import Optional
 
 import torch
 
@@ -43,6 +44,13 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=2,
         help="Synthetic per-round accept length; commit delta = accept-len + 1.",
+    )
+    parser.add_argument(
+        "--miss-every",
+        type=int,
+        default=0,
+        help="Every Nth round commits a bonus outside the guesses (forces the "
+        "slow path); 0 = only the unavoidable first-round miss.",
     )
     parser.add_argument("--mem-fraction-static", type=float, default=0.5)
     parser.add_argument(
@@ -80,25 +88,68 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+class _VerifierSim:
+    """Per-key emulation of the verifier's select/verify/commit protocol.
+
+    Tracks the chain the verifier is "verifying" (== the engine's backbone
+    next round) so hit commits exercise the engine's glue fast path exactly
+    like the real mesh does.
+    """
+
+    def __init__(
+        self, *, accept_len: int, fanout: int, rng: random.Random, vocab_size: int
+    ) -> None:
+        self.accept_len = accept_len
+        self.fanout = fanout
+        self.rng = rng
+        self.vocab_size = vocab_size
+        self.chain: Optional[list[int]] = None  # None => last round missed
+        self.pick_f = 1 if fanout > 1 else 0
+
+    def next_delta(self, units: list, *, force_miss: bool) -> list[int]:
+        """units = last block's [K+1][F][K+1] host list; returns the commit."""
+        if self.chain is None:
+            # Last round ran slow: its backbone is the guess-0 column
+            # (c_{a+1} == g_{a,0} on the slow path).
+            num_steps = len(units) - 1
+            self.chain = [units[a][0][0] for a in range(num_steps)]
+        case = min(self.accept_len, len(self.chain))
+        prefix = self.chain[:case]
+        if force_miss:
+            bonus = self.rng.randrange(self.vocab_size)
+            self.chain = None
+            return prefix + [bonus]
+        bonus = units[case][self.pick_f][0]
+        self.chain = list(units[case][self.pick_f][1:])
+        return prefix + [bonus]
+
+
 def _run_rounds(
     *,
     engine: EnumDraftEngine,
     keys: list[DraftReqKey],
-    rng: random.Random,
-    vocab_size: int,
-    delta_len: int,
+    sims: dict[DraftReqKey, _VerifierSim],
+    last_units: dict[DraftReqKey, list],
     rounds: int,
+    miss_every: int,
+    round_idx0: int = 0,
 ) -> list[float]:
     round_ms = []
-    for _ in range(rounds):
+    for r in range(rounds):
         for key in keys:
-            delta = [rng.randrange(vocab_size) for _ in range(delta_len)]
-            engine.apply_commit(key, delta)
+            if key in last_units:
+                force_miss = miss_every > 0 and (round_idx0 + r) % miss_every == 0
+                delta = sims[key].next_delta(last_units[key], force_miss=force_miss)
+                engine.apply_commit(key, delta)
+            # else: first round; the opened prompt is the pending delta.
         start = time.monotonic()
         packed = engine.draft_round(keys)
         torch.cuda.synchronize()
         round_ms.append(1000.0 * (time.monotonic() - start))
         assert packed is not None and packed["units_device"].shape[0] == len(keys)
+        units_host = packed["units_device"].cpu().tolist()
+        for i, key in enumerate(keys):
+            last_units[key] = units_host[i]
     return round_ms
 
 
@@ -142,6 +193,8 @@ def main() -> None:
     )
     rng = random.Random(42)
     keys = []
+    sims: dict[DraftReqKey, _VerifierSim] = {}
+    last_units: dict[DraftReqKey, list] = {}
     for i in range(args.batch_size):
         key = DraftReqKey(src_verifier_rank=0, request_id=f"bench-{i}")
         engine.open(
@@ -151,25 +204,33 @@ def main() -> None:
             committed_outputs=[],
         )
         keys.append(key)
-    delta_len = args.accept_len + 1
+        sims[key] = _VerifierSim(
+            accept_len=args.accept_len,
+            fanout=args.fanout,
+            rng=rng,
+            vocab_size=vocab_size,
+        )
 
     _run_rounds(
         engine=engine,
         keys=keys,
-        rng=rng,
-        vocab_size=vocab_size,
-        delta_len=delta_len,
+        sims=sims,
+        last_units=last_units,
         rounds=args.warmup_rounds,
+        miss_every=args.miss_every,
     )
     engine.profiler.round_ct = 0
     engine.profiler.phase_ms = {}
+    engine.hit_ct = 0
+    engine.miss_ct = 0
     round_ms = _run_rounds(
         engine=engine,
         keys=keys,
-        rng=rng,
-        vocab_size=vocab_size,
-        delta_len=delta_len,
+        sims=sims,
+        last_units=last_units,
         rounds=args.rounds,
+        miss_every=args.miss_every,
+        round_idx0=args.warmup_rounds,
     )
 
     if args.torch_profile_trace is not None:
@@ -182,10 +243,10 @@ def main() -> None:
             _run_rounds(
                 engine=engine,
                 keys=keys,
-                rng=rng,
-                vocab_size=vocab_size,
-                delta_len=delta_len,
+                sims=sims,
+                last_units=last_units,
                 rounds=3,
+                miss_every=args.miss_every,
             )
         prof.export_chrome_trace(args.torch_profile_trace)
         logger.info(
@@ -199,14 +260,16 @@ def main() -> None:
     round_ms.sort()
     n = len(round_ms)
     logger.info(
-        "drafter round (bs=%d K=%d F=%d prompt=%d delta=%d rounds=%d): "
-        "p50=%.2fms mean=%.2fms p90=%.2fms max=%.2fms",
+        "drafter round (bs=%d K=%d F=%d prompt=%d delta=%d rounds=%d "
+        "fast=%d slow=%d): p50=%.2fms mean=%.2fms p90=%.2fms max=%.2fms",
         args.batch_size,
         args.num_steps,
         args.fanout,
         args.prompt_len,
-        delta_len,
+        args.accept_len + 1,
         n,
+        engine.hit_ct,
+        engine.miss_ct,
         round_ms[n // 2],
         sum(round_ms) / n,
         round_ms[(n * 9) // 10],
