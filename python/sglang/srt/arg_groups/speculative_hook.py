@@ -154,6 +154,16 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
     if algo is not None:
         algo.handle_server_args(server_args)
 
+    # The decoupled drafter runs the draft model as a PLAIN decode engine: its
+    # ModelRunner (attention metadata sizing, decode CUDA graph capture) must
+    # not shape itself for colocated spec -- a spec-aware decode graph replays
+    # at num_draft_tokens positions per request and corrupts the enumeration
+    # harness's 1-token decode steps. The speculative_* numeric fields survive
+    # (they size the enumeration output); the algorithm is cleared once the
+    # role validator and the per-algorithm handler consumed it.
+    if server_args.is_decoupled_drafter():
+        server_args.speculative_algorithm = None
+
 
 def _handle_decoupled_spec(server_args: ServerArgs) -> None:
     """Validate and normalize the decoupled-spec role (verifier / drafter) args.
