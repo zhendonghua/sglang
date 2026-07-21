@@ -267,8 +267,8 @@ def _enum_batch(
     if base_committed_lens is None:
         base_committed_lens = [0] * len(pool_indices)
     if tokens is None:
-        # A well-formed batch_size * (K + 1) * F * K flat block.
-        row_stride = (num_steps + 1) * fanout * num_steps
+        # A well-formed batch_size * (K + 1) * F * (K + 1) flat block.
+        row_stride = (num_steps + 1) * fanout * (num_steps + 1)
         tokens = tuple(range(len(pool_indices) * row_stride))
     return DraftEnumerationBufferBatch(
         src_drafter_rank=src_drafter_rank,
@@ -284,11 +284,11 @@ def _enum_batch(
 
 class TestDraftEnumerationBufferBatch(CustomTestCase):
     def test_valid_block_stride_and_row_slicing(self):
-        # row_stride is the per-row (K + 1) * F * K layout size; num_tokens is
-        # batch_size rows of it. row_tokens(i) slices row i out of the shared
-        # flat buffer.
+        # row_stride is the per-row (K + 1) * F * (K + 1) layout size ((K+1)-wide
+        # [guess, chain] units); num_tokens is batch_size rows of it.
+        # row_tokens(i) slices row i out of the shared flat buffer.
         batch = _enum_batch(pool_indices=[1, 2], num_steps=2, fanout=3)
-        self.assertEqual(batch.row_stride, (2 + 1) * 3 * 2)
+        self.assertEqual(batch.row_stride, (2 + 1) * 3 * (2 + 1))
         self.assertEqual(batch.batch_size, 2)
         self.assertEqual(batch.num_tokens, 2 * batch.row_stride)
         self.assertEqual(len(batch.tokens), batch.num_tokens)

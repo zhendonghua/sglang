@@ -37,7 +37,7 @@ D_EP = "ipc:///tmp/decoupled-spec-itest-d"
 
 
 def _block(pool_idx=1, dst=0, tok=100) -> DraftEnumerationBufferBatch:
-    # Minimal K=1, F=1 enumeration block: row_stride = (K+1)*F*K = 2, one row.
+    # Minimal K=1, F=1 enumeration block: row_stride = (K+1)*F*(K+1) = 4, one row.
     return DraftEnumerationBufferBatch(
         src_drafter_rank=0,
         dst_verifier_rank=dst,
@@ -45,7 +45,7 @@ def _block(pool_idx=1, dst=0, tok=100) -> DraftEnumerationBufferBatch:
         fanout=1,
         pool_indices=[pool_idx],
         base_committed_lens=[0],
-        tokens=(tok, tok + 1),
+        tokens=(tok, tok + 1, tok + 2, tok + 3),
     )
 
 

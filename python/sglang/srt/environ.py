@@ -336,6 +336,12 @@ class Envs:
     # size the KV pool after CUDA-graph capture
     SGLANG_ENABLE_POST_CAPTURE_KV_SIZING = EnvBool(False)
 
+    # Decoupled spec: run the verifier against an in-process scripted fake
+    # drafter over the fake transport (single-process loopback correctness
+    # lock). Value = scripted behavior: "garbage" (valid stamps, chains that
+    # never match) or "stale" (stamps always one behind). None = off.
+    SGLANG_TEST_DECOUPLED_LOOPBACK = EnvStr(None)
+
     # Scheduler: memory leak test
     SGLANG_TEST_RETRACT = EnvBool(False)
     SGLANG_TEST_RETRACT_INTERVAL = EnvInt(3)

@@ -139,9 +139,14 @@ class DraftEnumerationBufferBatch:
     fanout (F) = bonus-token guesses per accept case; K + 1 = the previous
     round's possible accept lengths (0..K).
 
-    tokens: a flat B * (K + 1) * F * K tuple of vocab ids; row i starts at
-    i * row_stride, row_stride = (K + 1) * F * K, and within a row is indexed
-    [accept_case][guess][step] via flat = (accept_case * F + guess) * K + step.
+    tokens: a flat B * (K + 1) * F * (K + 1) tuple of vocab ids. Each
+    (accept_case, guess) unit is K + 1 wide: [guess, chain_1 .. chain_K] --
+    element 0 is the guessed bonus token itself (the GPU bonus-match key), the
+    rest is the chain drafted after it. A hit unit IS the verify row
+    (root = guess = the real bonus, then K draft tokens), so selection is one
+    index_select with no re-assembly. Row i starts at i * row_stride,
+    row_stride = (K + 1) * F * (K + 1), and within a row the unit for
+    (accept_case, guess) starts at (accept_case * F + guess) * (K + 1).
 
     pool_indices[i] is the seat (verifier req_to_token row) row i lands in,
     echoed from the req_pool_idx the verifier announced in DraftSync; landing is
@@ -169,7 +174,9 @@ class DraftEnumerationBufferBatch:
 
     @property
     def row_stride(self) -> int:
-        return (int(self.num_steps) + 1) * int(self.fanout) * int(self.num_steps)
+        # (K + 1) accept cases x F guesses x (K + 1)-wide [guess, chain] units.
+        unit_width = int(self.num_steps) + 1
+        return unit_width * int(self.fanout) * unit_width
 
     @property
     def batch_size(self) -> int:
@@ -236,7 +243,7 @@ class DraftEnumerationBufferBatch:
         if len(self.tokens) != self.num_tokens:
             raise ValueError(
                 "DraftEnumerationBufferBatch tokens length must equal "
-                "batch_size * (num_steps + 1) * fanout * num_steps: "
+                "batch_size * (num_steps + 1) * fanout * (num_steps + 1): "
                 f"batch_size={self.batch_size} "
                 f"num_steps={self.num_steps} fanout={self.fanout} "
                 f"expected={self.num_tokens} actual={len(self.tokens)}"

@@ -331,6 +331,7 @@ class Scheduler(
         # Parse args
         self.server_args = server_args
         self.nccl_port = port_args.nccl_port
+        self.decoupled_spec_ipc_config = port_args.decoupled_spec_ipc_config
         self.schedule_policy = server_args.schedule_policy
         self.enable_priority_scheduling = server_args.enable_priority_scheduling
         self.abort_on_priority_when_disabled = (
@@ -350,9 +351,16 @@ class Scheduler(
         self.enable_pdmux = server_args.enable_pdmux
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
         self.stream_interval = server_args.stream_interval
-        self.spec_algorithm = SpeculativeAlgorithm.from_string(
-            server_args.speculative_algorithm
-        )
+        if server_args.is_decoupled_drafter():
+            # The decoupled drafter is a plain decode engine: the speculative
+            # args only size its enumeration output; no colocated spec worker
+            # or spec batch path runs in this process (phase 6.1 drives the
+            # enumeration through the drafter mixin instead).
+            self.spec_algorithm = SpeculativeAlgorithm.NONE
+        else:
+            self.spec_algorithm = SpeculativeAlgorithm.from_string(
+                server_args.speculative_algorithm
+            )
         self.page_size = server_args.page_size
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
@@ -429,6 +437,9 @@ class Scheduler(
 
         # Launch a model worker and draft model worker if using speculative decoding
         self.init_model_worker()
+
+        # Wire the decoupled-spec verifier IPC (needs the worker's enum buffer)
+        self.maybe_init_decoupled_verify_manager()
 
         if (t := envs.SGLANG_TEST_STUCK_SCHEDULER_INIT.get()) > 0:
             time.sleep(t)
@@ -785,6 +796,17 @@ class Scheduler(
             target_worker=self.tp_worker,
         )
 
+        if self.server_args.is_decoupled_verifier():
+            # Decoupled verifier: verify-only worker over the target model; the
+            # draft model lives in the drafter process (decoupled_spec_role is
+            # a role orthogonal to the algorithm, so this wins over
+            # spec_algorithm.create_worker).
+            from sglang.srt.speculative.verify_worker import VerifyWorker
+
+            self.draft_worker = VerifyWorker(**draft_worker_kwargs)
+            self.external_corpus_manager = None
+            return
+
         if self.server_args.speculative_draft_load_format is not None:
             self.server_args.override(
                 "scheduler.draft_load_format",
@@ -808,6 +830,20 @@ class Scheduler(
             )
         else:
             self.external_corpus_manager = None
+
+    def maybe_init_decoupled_verify_manager(self):
+        if not self.server_args.is_decoupled_verifier():
+            self.decoupled_verify_manager = None
+            return
+
+        from sglang.srt.speculative.decoupled_verify_manager import (
+            DecoupledVerifyManager,
+        )
+
+        self.decoupled_verify_manager = DecoupledVerifyManager(
+            ipc_config=self.decoupled_spec_ipc_config,
+            verify_worker=self.draft_worker,
+        )
 
     def init_target_memory_pool(self):
         """Allocate target KV cache pools if they have not been allocated yet."""
@@ -3583,6 +3619,9 @@ class Scheduler(
             self.batch_result_processor.process_batch_result_prebuilt(batch)
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
+
+        if self.decoupled_verify_manager is not None:
+            self.decoupled_verify_manager.on_batch_result(batch)
 
         self.metrics_reporter.log_batch_result_stats(batch, result)
 

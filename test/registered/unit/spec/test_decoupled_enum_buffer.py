@@ -50,7 +50,7 @@ def _block(
     dst_verifier_rank=0,
     tokens=None,
 ) -> DraftEnumerationBufferBatch:
-    row_stride = (num_steps + 1) * fanout * num_steps
+    row_stride = (num_steps + 1) * fanout * (num_steps + 1)
     if tokens is None:
         tokens = tuple(range(len(pool_indices) * row_stride))
     return DraftEnumerationBufferBatch(
@@ -102,7 +102,7 @@ class TestDecoupledEnumBufferLanding(CustomTestCase):
         # block replaces both tokens and stamp (last write wins).
         buf = _buffer()
         buf.land(_block([3], [10]))
-        fresh = _block([3], [14], tokens=tuple(range(100, 100 + 12)))
+        fresh = _block([3], [14], tokens=tuple(range(100, 100 + 18)))
         buf.land(fresh)
         rows, stamps = buf.gather(torch.tensor([3], dtype=torch.int64))
         self.assertEqual(tuple(rows[0].tolist()), fresh.row_tokens(0))

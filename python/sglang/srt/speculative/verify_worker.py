@@ -1,0 +1,338 @@
+"""Decoupled verifier's spec worker: GPU-select a pre-enumerated chain, verify.
+
+``VerifyWorker`` is the verify half of decoupled speculative decoding for the
+STANDALONE (token-conditioned) drafter family. Each decode round it selects,
+entirely on the GPU, the ``[guess, chain]`` unit of the landed enumeration
+block that matches reality -- the previous round's accept case and bonus token
+-- pads misses to a bonus-seeded fallback row, and runs the shared eagle
+verify path (the exact code colocated STANDALONE verifies with, so committed
+outputs match the colocated baseline token for token). Prefill is a plain
+target extend. No draft model, no tree construction, no transport: blocks
+arrive in the ``DecoupledEnumBuffer`` via the verifier IPC thread.
+
+Select keys ride on ``batch.spec_info`` as an ``EnumSelectInput`` (the
+decoupled analog of the colocated ``next_draft_input`` relay, produced here at
+the end of every prefill / verify round and re-attached by the scheduler):
+
+- ``bonus_tokens``   -- last committed token per request = this round's root.
+- ``prev_accept_lens`` -- last round's accepted-draft count = the accept case.
+- ``base_committed_lens`` -- the total committed sequence length (prompt +
+  committed outputs) the in-flight enumeration must have been drafted from;
+  compared against the landed stamp for fresh-vs-stale, so a late or reused
+  block can never be consumed (only ever costs a fallback round).
+
+The unified fallback (stale stamp / bonus miss / never-landed seat) replaces
+the selected unit with ``[bonus, bonus, ...]``: the root is the real bonus, so
+the row verifies as a plain 1-token decode; the junk tail is safe because
+verify only ever accepts tokens the target model itself predicts.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Optional
+
+import torch
+
+from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.base_verify_worker import BaseVerifyWorker
+from sglang.srt.speculative.decoupled_enum_buffer import DecoupledEnumBuffer
+from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
+from sglang.srt.speculative.eagle_utils import default_tree_mask_mode
+from sglang.srt.speculative.eagle_worker_common import (
+    build_eagle_verify_input,
+    run_eagle_verify,
+)
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_utils import get_plan_stream
+
+if TYPE_CHECKING:
+    from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.managers.utils import GenerationBatchResult
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class EnumSelectInput(EagleDraftInput):
+    """Per-round GPU select keys for the enumeration buffer.
+
+    Subclasses the (grandfathered dataclass) ``EagleDraftInput`` so generic
+    spec_info plumbing (SpecInput type checks, idle handling) keeps working;
+    ``bonus_tokens`` is inherited. ``filter_batch`` / ``merge_batch`` are
+    overridden outright: the parent slices draft-model fields (topk_p /
+    hidden_states) this input never carries.
+    """
+
+    # [bs] int64: last round's accepted-draft count (0..K) = the accept case.
+    prev_accept_lens: Optional[torch.Tensor] = None
+    # [bs] int64: expected enumeration-base stamp (total committed seq len).
+    base_committed_lens: Optional[torch.Tensor] = None
+
+    def filter_batch(
+        self,
+        new_indices: torch.Tensor,
+        has_been_filtered: bool = True,
+        new_indices_cpu=None,
+    ):
+        if has_been_filtered:
+            # The verify path already dropped finished rows; keep the prefix.
+            keep = len(new_indices)
+            self.bonus_tokens = self.bonus_tokens[:keep]
+            self.prev_accept_lens = self.prev_accept_lens[:keep]
+            self.base_committed_lens = self.base_committed_lens[:keep]
+        else:
+            self.bonus_tokens = self.bonus_tokens[new_indices]
+            self.prev_accept_lens = self.prev_accept_lens[new_indices]
+            self.base_committed_lens = self.base_committed_lens[new_indices]
+
+    def merge_batch(self, spec_info: EnumSelectInput):
+        self.bonus_tokens = torch.cat(
+            [self.bonus_tokens, spec_info.bonus_tokens], axis=0
+        )
+        self.prev_accept_lens = torch.cat(
+            [self.prev_accept_lens, spec_info.prev_accept_lens], axis=0
+        )
+        self.base_committed_lens = torch.cat(
+            [self.base_committed_lens, spec_info.base_committed_lens], axis=0
+        )
+
+
+def select_enum_units(
+    rows: torch.Tensor,
+    stamps: torch.Tensor,
+    *,
+    bonus_tokens: torch.Tensor,
+    prev_accept_lens: torch.Tensor,
+    base_committed_lens: torch.Tensor,
+    num_cases: int,
+    fanout: int,
+    unit_width: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pure GPU select: (selected [bs, unit_width], hits [bs] bool). No host sync.
+
+    ``rows`` / ``stamps`` are the seat-gathered enumeration rows
+    ([bs, num_cases * fanout * unit_width]) and their freshness stamps. Two
+    steps: pick the (accept_case, bonus_guess) unit, then judge -- a row is a
+    hit iff its stamp equals the expected base (fresh) AND the real bonus is
+    among the case's F guesses (unit element 0). Miss rows become the
+    bonus-seeded fallback ``[bonus, bonus, ...]``: the root is the real bonus,
+    and the junk tail is safe because verify only accepts target-agreeing
+    tokens -- the row degrades to a plain 1-token decode.
+    """
+    bs = rows.shape[0]
+    units = rows.view(bs, num_cases, fanout, unit_width)
+
+    bonus_tokens = bonus_tokens.to(torch.int64)
+    fresh = stamps.eq(base_committed_lens)
+    # Clamp guards a protocol bug from turning into a device-side OOB; a wrong
+    # case then simply fails the guess match and falls back.
+    cases = prev_accept_lens.clamp(min=0, max=num_cases - 1)
+
+    batch_arange = torch.arange(bs, device=rows.device)
+    case_units = units[batch_arange, cases]  # [bs, F, unit_width]
+    guesses = case_units[:, :, 0]  # [bs, F]
+    guess_matches = guesses.eq(bonus_tokens.unsqueeze(1))  # [bs, F]
+    hits = fresh & guess_matches.any(dim=1)
+    # First matching guess; 0 (overwritten by the fallback) when none.
+    guess_indices = guess_matches.to(torch.int64).argmax(dim=1)
+    selected = case_units[batch_arange, guess_indices]  # [bs, unit_width]
+
+    fallback_units = bonus_tokens.unsqueeze(1).expand(bs, unit_width)
+    selected = torch.where(hits.unsqueeze(1), selected, fallback_units)
+    return selected, hits
+
+
+class VerifyWorker(BaseVerifyWorker):
+    """Target-side verify worker for the decoupled STANDALONE drafter."""
+
+    def __init__(
+        self,
+        server_args: ServerArgs,
+        gpu_id: int,
+        ps: ParallelState,
+        nccl_port: int,
+        target_worker: TpModelWorker,
+    ):
+        self.server_args = server_args
+        self.gpu_id = gpu_id
+        self.device = server_args.device
+        self._target_worker = target_worker
+
+        # Role validation pinned topk to 1 (linear chains only) and
+        # num_draft_tokens to num_steps + 1.
+        self.topk = server_args.speculative_eagle_topk
+        self.speculative_num_steps = server_args.speculative_num_steps
+        self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
+        self.speculative_fanout = server_args.speculative_fanout
+        self.speculative_algorithm = SpeculativeAlgorithm.from_string(
+            server_args.speculative_algorithm
+        )
+        assert self.topk == 1 and (
+            self.speculative_num_draft_tokens == self.speculative_num_steps + 1
+        ), "decoupled verify requires topk == 1 chains (role validator pins this)"
+
+        # Sizes the scheduler's per-decode KV over-alloc, exactly as the
+        # colocated standalone worker does.
+        EagleDraftInput.ALLOC_LEN_PER_DECODE = max(
+            self.speculative_num_steps * self.topk, self.speculative_num_draft_tokens
+        )
+
+        self.tree_mask_mode = default_tree_mask_mode()
+        self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
+
+        # topk=1 chain constants for build_eagle_verify_input (runtime-invariant;
+        # same construction as EagleDraftWorker._rebuild_topk1_chain_buffers).
+        num_steps = self.speculative_num_steps
+        decode_max_bs = (
+            server_args.cuda_graph_config.decode.max_bs
+            if server_args.cuda_graph_config is not None
+            else None
+        )
+        max_bs = max(decode_max_bs or 0, server_args.max_running_requests or 0, 1)
+        parent_width = num_steps if num_steps > 1 else 0
+        self._chain_parents = torch.arange(
+            -1, parent_width - 1, dtype=torch.long, device=self.device
+        ).repeat(max_bs, 1)
+        self._chain_score_indices = torch.arange(
+            num_steps, dtype=torch.long, device=self.device
+        ).repeat(max_bs, 1)
+
+        # The GPU landing buffer is sized off req_to_token, which exists only
+        # after the scheduler allocates memory pools (alloc_memory_pool below).
+        self.enum_buffer: Optional[DecoupledEnumBuffer] = None
+
+        # Select outcome of the last decode round ([bs] bool, GPU); the sync
+        # scheduler mixin consumes it for hit / fallback accounting.
+        self.last_select_hits: Optional[torch.Tensor] = None
+
+    def alloc_memory_pool(
+        self,
+        memory_pool_config=None,
+        req_to_token_pool=None,
+        token_to_kv_pool_allocator=None,
+    ):
+        self.req_to_token_pool = req_to_token_pool
+        self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        self.enum_buffer = DecoupledEnumBuffer(
+            device=self.device,
+            req_to_token_pool=req_to_token_pool,
+            num_steps=self.speculative_num_steps,
+            fanout=self.speculative_fanout,
+            verifier_rank=self.server_args.decoupled_spec_rank,
+            enable_overlap=False,
+        )
+
+    def forward_batch_generation(
+        self, batch: ScheduleBatch, on_publish=None
+    ) -> GenerationBatchResult:
+        if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+            return self._forward_target_prefill(batch, on_publish)
+
+        verify_input = self._build_verify_input(batch)
+        batch.spec_info = verify_input
+        batch_output = self._verify(batch)
+        if on_publish is not None:
+            on_publish(batch_output.new_seq_lens)
+        return batch_output
+
+    def _forward_target_prefill(
+        self, batch: ScheduleBatch, on_publish
+    ) -> GenerationBatchResult:
+        # Pure target extend; STANDALONE never captures hidden states.
+        batch_output = self.target_worker.forward_batch_generation(
+            batch, capture_hidden_mode=CaptureHiddenMode.NULL
+        )
+        # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
+        batch_output.new_seq_lens = batch.seq_lens
+        if on_publish is not None:
+            on_publish(batch_output.new_seq_lens)
+        # Seed the first decode round's select keys: the sampled first token is
+        # both the committed bonus and round 1's root; the virtual "round 0"
+        # accepted 0 drafts; the first enumeration grows from prompt + that
+        # token, whose total length is seq_lens + 1.
+        batch_output.next_draft_input = EnumSelectInput(
+            bonus_tokens=batch_output.next_token_ids.to(torch.int32),
+            prev_accept_lens=torch.zeros_like(batch.seq_lens, dtype=torch.int64),
+            base_committed_lens=(batch.seq_lens + 1).to(torch.int64),
+        )
+        return batch_output
+
+    def _build_verify_input(self, batch: ScheduleBatch) -> EagleVerifyInput:
+        if batch.forward_mode.is_idle():
+            return EagleVerifyInput.create_idle_input(
+                topk=self.topk,
+                spec_steps=self.speculative_num_steps,
+                num_verify_tokens=self.speculative_num_draft_tokens,
+                device=self.device,
+            )
+
+        select_input: EnumSelectInput = batch.spec_info
+        selected, hits = self._select_enum_units(batch, select_input)
+        self.last_select_hits = hits
+
+        # The selected unit IS the verify row: [root(=real bonus), K drafts].
+        draft_input = EagleDraftInput(
+            bonus_tokens=selected[:, 0].to(torch.int32).contiguous()
+        )
+        return build_eagle_verify_input(
+            batch,
+            draft_input,
+            self._chain_parents[: selected.shape[0]],
+            self._chain_score_indices[: selected.shape[0]],
+            selected[:, 1:].contiguous(),
+            None,  # draft_probs: rejection sampling is out of scope
+            target_worker=self.target_worker,
+            topk=self.topk,
+            num_steps=self.speculative_num_steps,
+            num_draft_tokens=self.speculative_num_draft_tokens,
+            tree_mask_mode=self.tree_mask_mode,
+            device=self.device,
+        )
+
+    def _select_enum_units(
+        self, batch: ScheduleBatch, select_input: EnumSelectInput
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        rows, stamps = self.enum_buffer.gather(batch.req_pool_indices)
+        return select_enum_units(
+            rows,
+            stamps,
+            bonus_tokens=select_input.bonus_tokens,
+            prev_accept_lens=select_input.prev_accept_lens,
+            base_committed_lens=select_input.base_committed_lens,
+            num_cases=self.speculative_num_steps + 1,
+            fanout=self.speculative_fanout,
+            unit_width=self.speculative_num_draft_tokens,
+        )
+
+    def _verify(self, batch: ScheduleBatch) -> GenerationBatchResult:
+        batch_output = run_eagle_verify(
+            batch,
+            target_worker=self.target_worker,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            plan_stream=self.plan_stream,
+            plan_stream_ctx=self.plan_stream_ctx,
+            topk=self.topk,
+            num_steps=self.speculative_num_steps,
+            num_draft_tokens=self.speculative_num_draft_tokens,
+            device=self.device,
+            metadata_ready_pre_pad=False,
+            finalize_tree_path=True,  # identity at topk == 1
+        )
+        # Next round's select keys, all GPU-resident (no host sync):
+        # - the new bonus is the next root;
+        # - accepted drafts (accept_lens includes the bonus) name the case;
+        # - the next enumeration grows from this round's committed prefix plus
+        #   its root, i.e. entry seq_lens + 1 in total-length terms.
+        next_bonus_tokens = batch_output.next_draft_input.bonus_tokens
+        batch_output.next_draft_input = EnumSelectInput(
+            bonus_tokens=next_bonus_tokens,
+            prev_accept_lens=(batch_output.accept_lens - 1).to(torch.int64),
+            base_committed_lens=(batch.seq_lens + 1).to(torch.int64),
+        )
+        return batch_output

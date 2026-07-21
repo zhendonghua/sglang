@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 import queue
 import threading
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable, Optional
 
 from sglang.srt.speculative.decoupled_spec_io import (
     DraftControlBatch,
@@ -54,12 +54,16 @@ class VerifierIpcThread:
         *,
         transport: BaseDecoupledSpecTransport,
         enum_buffer: DecoupledEnumBuffer,
+        on_land: Optional[Callable[[DraftEnumerationBufferBatch], None]] = None,
     ) -> None:
         self.transport = transport
         # The GPU landing buffer. land() holds verifier_rank and rejects a block
         # routed to another verifier, so this thread does no rank check of its
         # own -- only envelope validation.
         self.enum_buffer = enum_buffer
+        # Post-land hook (runs on this thread, after the scatter is enqueued);
+        # the verify manager mirrors arrival stamps here for the sync-mode gate.
+        self._on_land = on_land
         self._send_queue: queue.SimpleQueue[DraftControlBatch] = queue.SimpleQueue()
         self._closed = threading.Event()
         self._thread = threading.Thread(
@@ -137,6 +141,8 @@ class VerifierIpcThread:
             # seat-range guard all live in land(); the SYNC scatter runs on the
             # current stream (6.3 moves it to a copy stream).
             self.enum_buffer.land(block)
+            if self._on_land is not None:
+                self._on_land(block)
         return did_work
 
     def _route_enumeration_message(

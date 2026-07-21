@@ -49,7 +49,7 @@ def _control_msg(rid="r", drafter_rank=0) -> DraftMeshMessage:
 
 
 def _enum_msg(pool_idx=1, verifier_rank=0, tok=7) -> DraftMeshMessage:
-    # Minimal K=1, F=1 block: row_stride = (K+1)*F*K = 2, one row of 2 token ids.
+    # Minimal K=1, F=1 block: row_stride = (K+1)*F*(K+1) = 4, one row of 4 ids.
     block = DraftEnumerationBufferBatch(
         src_drafter_rank=0,
         dst_verifier_rank=verifier_rank,
@@ -57,7 +57,7 @@ def _enum_msg(pool_idx=1, verifier_rank=0, tok=7) -> DraftMeshMessage:
         fanout=1,
         pool_indices=[pool_idx],
         base_committed_lens=[0],
-        tokens=(tok, tok + 1),
+        tokens=(tok, tok + 1, tok + 2, tok + 3),
     )
     return DraftMeshMessage.from_enumeration_buffer_batch(block)
 

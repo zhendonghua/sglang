@@ -60,8 +60,11 @@ class DecoupledEnumBuffer:
         # From DecoupledSpecIpcConfig.rank in phase 5b; land() rejects a block
         # routed to a different verifier.
         self.verifier_rank = int(verifier_rank)
-        # (K+1) accept cases * F bonus guesses * K chain steps, flat per row.
-        self.row_width = (self.num_steps + 1) * self.fanout * self.num_steps
+        # (K+1) accept cases * F bonus guesses * (K+1)-wide [guess, chain] units
+        # (unit element 0 = the guessed bonus itself = the GPU match key; a hit
+        # unit is the verify row), flat per row.
+        self.unit_width = self.num_steps + 1
+        self.row_width = self.unit_width * self.fanout * self.unit_width
         # req_to_token.shape[0] == max_running + 1, so seat 0 stays the harmless
         # cuda-graph padding row; never size to bare max_running.
         self.seats = int(req_to_token_pool.req_to_token.shape[0])
@@ -157,10 +160,10 @@ class DecoupledEnumBuffer:
         self, req_pool_indices: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Gather this batch's rows + freshness stamps from the read-side slot:
-        (rows [B, (K+1)*F*K], base_committed_lens [B]). The verify forward (phase
-        4a) compares base_committed_lens against the live committed length for
-        fresh-vs-fallback, then selects the winning chain by (accept_case,
-        bonus_guess).
+        (rows [B, (K+1)*F*(K+1)], base_committed_lens [B]). The verify forward
+        (phase 4a) compares base_committed_lens against the live committed
+        length for fresh-vs-fallback, then selects the winning [guess, chain]
+        unit by (accept_case, bonus_guess).
         """
         slot = self._read_slot
         rows = self.enum_tokens[slot][req_pool_indices]
