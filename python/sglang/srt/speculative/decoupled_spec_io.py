@@ -47,11 +47,19 @@ class DraftSync:
     The verifier is the source of truth for committed tokens. DraftSync gives
     the drafter the prompt and already committed output prefix that it must
     align to before it can emit draft tail tokens.
+
+    req_pool_idx is the seat (req_to_token row) the request holds on the owning
+    verifier. The drafter echoes it in every enumeration block row, so the
+    verifier lands rows with a pure GPU scatter and no host rid lookup. A seat
+    only changes across a retraction re-admit, and that path re-opens the
+    request with a fresh DraftSync carrying the new seat; a late block aimed at
+    the old seat is defused by its base_committed_len stamp, not by routing.
     """
 
     request_id: str
     src_verifier_rank: int
     dst_drafter_rank: int
+    req_pool_idx: int
     prompt_token_ids: list[int] = field(default_factory=list)
     committed_outputs: list[int] = field(default_factory=list)
 
@@ -135,21 +143,29 @@ class DraftEnumerationBufferBatch:
     i * row_stride, row_stride = (K + 1) * F * K, and within a row is indexed
     [accept_case][guess][step] via flat = (accept_case * F + guess) * K + step.
 
+    pool_indices[i] is the seat (verifier req_to_token row) row i lands in,
+    echoed from the req_pool_idx the verifier announced in DraftSync; landing is
+    a pure GPU scatter with no host rid lookup. A stale echo (the request left
+    and the seat was reused) is defused by the stamp below, never by routing.
+
     base_committed_lens[i] is the staleness version (committed length row i was
     drafted from) the verifier judges usability on entirely on GPU.
 
     src_drafter_rank / dst_verifier_rank are scalars because a wire message has
     one sender and one destination; aggregation across drafters happens on the
     verifier, collecting the messages it receives keyed on src_drafter_rank.
+    rids is optional debug labeling (parallel to pool_indices when present);
+    nothing routes on it.
     """
 
     src_drafter_rank: int
     dst_verifier_rank: int
     num_steps: int
     fanout: int
-    rids: list[str] = field(default_factory=list)
+    pool_indices: list[int] = field(default_factory=list)
     base_committed_lens: list[int] = field(default_factory=list)
     tokens: tuple[int, ...] = ()
+    rids: list[str] = field(default_factory=list)
 
     @property
     def row_stride(self) -> int:
@@ -157,17 +173,11 @@ class DraftEnumerationBufferBatch:
 
     @property
     def batch_size(self) -> int:
-        return len(self.rids)
+        return len(self.pool_indices)
 
     @property
     def num_tokens(self) -> int:
         return self.batch_size * self.row_stride
-
-    def draft_key(self, i: int) -> DraftReqKey:
-        return DraftReqKey(
-            src_verifier_rank=int(self.dst_verifier_rank),
-            request_id=self.rids[i],
-        )
 
     def row_tokens(self, i: int) -> tuple[int, ...]:
         return self.tokens[i * self.row_stride : (i + 1) * self.row_stride]
@@ -183,29 +193,44 @@ class DraftEnumerationBufferBatch:
                 "DraftEnumerationBufferBatch fanout must be >= 1: "
                 f"batch_size={self.batch_size} fanout={self.fanout}"
             )
-        if len(self.rids) != len(self.base_committed_lens):
+        if len(self.pool_indices) != len(self.base_committed_lens):
             raise ValueError(
-                "DraftEnumerationBufferBatch rids and base_committed_lens must "
-                "have equal length: "
-                f"len(rids)={len(self.rids)} "
+                "DraftEnumerationBufferBatch pool_indices and "
+                "base_committed_lens must have equal length: "
+                f"len(pool_indices)={len(self.pool_indices)} "
                 f"len(base_committed_lens)={len(self.base_committed_lens)}"
             )
-        seen_rids: set[str] = set()
-        for rid in self.rids:
-            if rid in seen_rids:
+        if self.rids and len(self.rids) != len(self.pool_indices):
+            raise ValueError(
+                "DraftEnumerationBufferBatch rids, when present, must parallel "
+                "pool_indices: "
+                f"len(rids)={len(self.rids)} "
+                f"len(pool_indices)={len(self.pool_indices)}"
+            )
+        seen_pool_indices: set[int] = set()
+        for pool_idx in self.pool_indices:
+            pool_idx = int(pool_idx)
+            if pool_idx < 1:
+                # Seat 0 is the cuda-graph padding row on the verifier and is
+                # never assigned to a live request.
                 raise ValueError(
-                    "DraftEnumerationBufferBatch rids must be unique (one row "
-                    "per request): duplicate rows resolve to the same seat and "
-                    "make the verifier-side scatter's winner nondeterministic: "
-                    f"batch_size={self.batch_size} duplicate_rid={rid}"
+                    "DraftEnumerationBufferBatch pool_indices must be >= 1: "
+                    f"batch_size={self.batch_size} pool_idx={pool_idx}"
                 )
-            seen_rids.add(rid)
+            if pool_idx in seen_pool_indices:
+                raise ValueError(
+                    "DraftEnumerationBufferBatch pool_indices must be unique "
+                    "(one row per seat): duplicate rows make the verifier-side "
+                    "scatter's winner nondeterministic: "
+                    f"batch_size={self.batch_size} duplicate_pool_idx={pool_idx}"
+                )
+            seen_pool_indices.add(pool_idx)
         for i, base_committed_len in enumerate(self.base_committed_lens):
             if int(base_committed_len) < 0:
                 raise ValueError(
                     "DraftEnumerationBufferBatch base_committed_lens must be "
                     "non-negative: "
-                    f"request_id={self.rids[i]} "
+                    f"pool_idx={self.pool_indices[i]} "
                     f"base_committed_len={base_committed_len}"
                 )
         if len(self.tokens) != self.num_tokens:

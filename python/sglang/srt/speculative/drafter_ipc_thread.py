@@ -95,7 +95,7 @@ class DrafterIpcThread:
     def submit_draft_results(self, result_batch: DraftEnumerationBufferBatch) -> None:
         # One block per (dst) verifier; the drafter scheduler produces a fresh
         # block each round and hands it off, so no defensive snapshot is needed.
-        if not result_batch.rids:
+        if not result_batch.pool_indices:
             return
         self._send_queue.put(result_batch)
         self._wakeup.set()
@@ -174,7 +174,7 @@ class DrafterIpcThread:
         # message, one verifier per block), so it routes to exactly one peer -- no
         # per-row grouping. A drafter serving M:N verifiers submits one block per
         # verifier, each already addressed.
-        if not result_batch.rids:
+        if not result_batch.pool_indices:
             return
         self.transport.send(
             int(result_batch.dst_verifier_rank),

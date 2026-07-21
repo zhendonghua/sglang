@@ -140,7 +140,10 @@ class TestDraftControlInbox(CustomTestCase):
 
     def _sync(self, rid, drafter_rank=0):
         return DraftSync(
-            request_id=rid, src_verifier_rank=0, dst_drafter_rank=drafter_rank
+            request_id=rid,
+            src_verifier_rank=0,
+            dst_drafter_rank=drafter_rank,
+            req_pool_idx=1,
         )
 
     def _close(self, rid, drafter_rank=0):
@@ -250,7 +253,7 @@ class TestDraftControlInbox(CustomTestCase):
 
 
 def _enum_batch(
-    rids=("r",),
+    pool_indices=(1,),
     *,
     num_steps=2,
     fanout=3,
@@ -258,22 +261,24 @@ def _enum_batch(
     src_drafter_rank=0,
     dst_verifier_rank=0,
     tokens=None,
+    rids=(),
 ) -> DraftEnumerationBufferBatch:
-    rids = list(rids)
+    pool_indices = list(pool_indices)
     if base_committed_lens is None:
-        base_committed_lens = [0] * len(rids)
+        base_committed_lens = [0] * len(pool_indices)
     if tokens is None:
         # A well-formed batch_size * (K + 1) * F * K flat block.
         row_stride = (num_steps + 1) * fanout * num_steps
-        tokens = tuple(range(len(rids) * row_stride))
+        tokens = tuple(range(len(pool_indices) * row_stride))
     return DraftEnumerationBufferBatch(
         src_drafter_rank=src_drafter_rank,
         dst_verifier_rank=dst_verifier_rank,
         num_steps=num_steps,
         fanout=fanout,
-        rids=rids,
+        pool_indices=pool_indices,
         base_committed_lens=list(base_committed_lens),
         tokens=tokens,
+        rids=list(rids),
     )
 
 
@@ -281,8 +286,8 @@ class TestDraftEnumerationBufferBatch(CustomTestCase):
     def test_valid_block_stride_and_row_slicing(self):
         # row_stride is the per-row (K + 1) * F * K layout size; num_tokens is
         # batch_size rows of it. row_tokens(i) slices row i out of the shared
-        # flat buffer, and draft_key(i) keys on the destination verifier.
-        batch = _enum_batch(rids=["a", "b"], num_steps=2, fanout=3)
+        # flat buffer.
+        batch = _enum_batch(pool_indices=[1, 2], num_steps=2, fanout=3)
         self.assertEqual(batch.row_stride, (2 + 1) * 3 * 2)
         self.assertEqual(batch.batch_size, 2)
         self.assertEqual(batch.num_tokens, 2 * batch.row_stride)
@@ -292,17 +297,6 @@ class TestDraftEnumerationBufferBatch(CustomTestCase):
         stride = batch.row_stride
         self.assertEqual(batch.row_tokens(0), tuple(range(0, stride)))
         self.assertEqual(batch.row_tokens(1), tuple(range(stride, 2 * stride)))
-
-    def test_draft_key_uses_dst_verifier_rank(self):
-        # The owning verifier is the destination rank; draft_key must key on it
-        # so the drafter-side table is unambiguous across verifier ranks.
-        batch = _enum_batch(rids=["req-9", "req-10"], dst_verifier_rank=4)
-        self.assertEqual(
-            batch.draft_key(0), DraftReqKey(src_verifier_rank=4, request_id="req-9")
-        )
-        self.assertEqual(
-            batch.draft_key(1), DraftReqKey(src_verifier_rank=4, request_id="req-10")
-        )
 
     def test_num_steps_below_one_raises(self):
         with self.assertRaises(ValueError):
@@ -314,28 +308,40 @@ class TestDraftEnumerationBufferBatch(CustomTestCase):
 
     def test_negative_base_committed_len_raises(self):
         with self.assertRaises(ValueError):
-            _enum_batch(rids=["r"], base_committed_lens=[-1]).validate()
+            _enum_batch(pool_indices=[1], base_committed_lens=[-1]).validate()
 
-    def test_rids_base_committed_lens_length_mismatch_raises(self):
+    def test_pool_indices_base_committed_lens_length_mismatch_raises(self):
         # batch_size must be consistent across the parallel per-row arrays.
         with self.assertRaises(ValueError):
-            _enum_batch(rids=["a", "b"], base_committed_lens=[0]).validate()
+            _enum_batch(pool_indices=[1, 2], base_committed_lens=[0]).validate()
 
-    def test_duplicate_rids_raise(self):
-        # One row per request: duplicate rids would resolve to the same seat and
-        # make the verifier-side scatter's winning row/stamp nondeterministic.
+    def test_duplicate_pool_indices_raise(self):
+        # One row per seat: duplicate pool indices would make the verifier-side
+        # scatter's winning row/stamp nondeterministic.
         with self.assertRaises(ValueError):
-            _enum_batch(rids=["a", "a"], base_committed_lens=[0, 0]).validate()
+            _enum_batch(pool_indices=[1, 1], base_committed_lens=[0, 0]).validate()
+
+    def test_pool_idx_below_one_raises(self):
+        # Seat 0 is the verifier's cuda-graph padding row and is never assigned
+        # to a live request; a block naming it is malformed peer data.
+        with self.assertRaises(ValueError):
+            _enum_batch(pool_indices=[0]).validate()
+
+    def test_debug_rids_length_mismatch_raises(self):
+        # rids is optional debug labeling, but when present it must stay
+        # parallel to pool_indices or the labels silently mislabel rows.
+        with self.assertRaises(ValueError):
+            _enum_batch(pool_indices=[1, 2], rids=["only-one"]).validate()
 
     def test_wrong_tokens_length_raises(self):
         # One token short of the batch_size * (K + 1) * F * K block.
-        batch = _enum_batch(rids=["a", "b"], num_steps=2, fanout=3)
+        batch = _enum_batch(pool_indices=[1, 2], num_steps=2, fanout=3)
         short = DraftEnumerationBufferBatch(
             src_drafter_rank=batch.src_drafter_rank,
             dst_verifier_rank=batch.dst_verifier_rank,
             num_steps=batch.num_steps,
             fanout=batch.fanout,
-            rids=batch.rids,
+            pool_indices=batch.pool_indices,
             base_committed_lens=batch.base_committed_lens,
             tokens=batch.tokens[:-1],
         )

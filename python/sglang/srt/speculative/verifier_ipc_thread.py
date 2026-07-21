@@ -3,9 +3,10 @@
 Control batches from the verifier are forwarded to the drafter over an injected
 ``BaseDecoupledSpecTransport``; enumeration buffer blocks received from the
 drafter are landed into the verifier's GPU ``DecoupledEnumBuffer`` (verifier
-routing + staleness live in ``plan_landing`` / ``DecoupledEnumBuffer.land``,
-keyed by the ``DecoupledSlotTable`` rid -> seat map the scheduler maintains).
-Envelope validation lives here; the wire lives in the transport.
+routing + staleness live in ``DecoupledEnumBuffer.land``; each block row names
+its own seat via the pool_idx echoed from DraftSync, so there is no host rid
+lookup on this path). Envelope validation lives here; the wire lives in the
+transport.
 
 The loop body is factored into ``_step()`` so it can be driven directly (and
 deterministically) by the fake-transport integration tests, while production
@@ -32,7 +33,6 @@ from sglang.srt.speculative.decoupled_spec_transport import (
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.decoupled_enum_buffer import DecoupledEnumBuffer
-    from sglang.srt.speculative.decoupled_slot_table import DecoupledSlotTable
 
 logger = logging.getLogger(__name__)
 
@@ -54,14 +54,12 @@ class VerifierIpcThread:
         *,
         transport: BaseDecoupledSpecTransport,
         enum_buffer: DecoupledEnumBuffer,
-        slot_table: DecoupledSlotTable,
     ) -> None:
         self.transport = transport
-        # The GPU landing buffer + its rid -> seat map. land() holds verifier_rank
-        # and rejects a block routed to another verifier, so this thread does no
-        # rank check of its own -- only envelope validation.
+        # The GPU landing buffer. land() holds verifier_rank and rejects a block
+        # routed to another verifier, so this thread does no rank check of its
+        # own -- only envelope validation.
         self.enum_buffer = enum_buffer
-        self.slot_table = slot_table
         self._send_queue: queue.SimpleQueue[DraftControlBatch] = queue.SimpleQueue()
         self._closed = threading.Event()
         self._thread = threading.Thread(
@@ -136,9 +134,9 @@ class VerifierIpcThread:
             did_work = True
             block = self._route_enumeration_message(message)
             # Verifier routing (wrong-verifier reject), validate(), and the
-            # rid -> seat lookup all live in land() -> plan_landing; the SYNC
-            # scatter runs on the current stream (6.3 moves it to a copy stream).
-            self.enum_buffer.land(block, self.slot_table)
+            # seat-range guard all live in land(); the SYNC scatter runs on the
+            # current stream (6.3 moves it to a copy stream).
+            self.enum_buffer.land(block)
         return did_work
 
     def _route_enumeration_message(

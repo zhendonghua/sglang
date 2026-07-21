@@ -8,10 +8,15 @@ forward to consume.
 Pool-indexed by req_pool_idx like FutureMap's relays (managers/overlap_utils.py),
 so the forward gathers it with the same batch.req_pool_indices as every other
 per-request tensor; leading dim = req_to_token.shape[0] (max_running + 1; seat 0
-is the harmless cuda-graph padding row). Each seat carries a base_committed_len
-stamp; the verify forward (phase 4a) compares it against the request's live
-committed length for fresh-vs-fallback, and a never-written / reset seat holds a
-sentinel that always falls back.
+is the harmless cuda-graph padding row). Routing is carried by the block itself:
+each row echoes the req_pool_idx the verifier announced in DraftSync, so landing
+is one GPU scatter with no host rid lookup. Each seat carries a
+base_committed_len stamp; the verify forward (phase 4a) compares it against the
+request's live committed length for fresh-vs-fallback, and a never-written /
+reset seat holds a sentinel that always falls back. A late block whose request
+already left lands harmlessly: its seat is either free (nobody gathers it) or
+reused, where reset_slot() at re-assignment plus the stamp mismatch keep it on
+the fallback path.
 
 Phase 1b is SYNC (buf_count == 1: land scatters on the current stream, the caller
 synchronizes before gather). The async overlap form (pinned staging + a private
@@ -24,10 +29,6 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from sglang.srt.speculative.decoupled_slot_table import (
-    DecoupledSlotTable,
-    plan_landing,
-)
 from sglang.srt.speculative.decoupled_spec_io import DraftEnumerationBufferBatch
 
 # Stamp for a seat with no valid block (never written, or reset on realloc); a
@@ -90,20 +91,28 @@ class DecoupledEnumBuffer:
         # the forward reads the slot the daemon is not writing.
         return self._write_slot if self.buf_count == 1 else 1 - self._write_slot
 
-    def land(
-        self,
-        block: DraftEnumerationBufferBatch,
-        slot_table: DecoupledSlotTable,
-    ) -> None:
-        """Scatter a block's surviving rows + stamps into their seats.
+    def land(self, block: DraftEnumerationBufferBatch) -> None:
+        """Scatter a block's rows + stamps into the seats its pool_indices name.
 
-        Called by the recv daemon; routing is decided by plan_landing. Phase 1b
-        scatters on the current stream (SYNC); phase 6.3 moves it onto a private
-        copy stream with pinned staging.
+        Called by the recv daemon. Routing rides in the block (the drafter
+        echoes each request's DraftSync req_pool_idx), so this is validation +
+        one GPU scatter. Phase 1b scatters on the current stream (SYNC); phase
+        6.3 moves it onto a private copy stream with pinned staging.
 
-        NOTE: like plan_landing, the raise below runs on the recv daemon thread,
-        whose loop dies on an uncaught exception. TODO(phase 5c): quarantine.
+        NOTE: the raises below run on the recv daemon thread, whose loop dies on
+        an uncaught exception. TODO(phase 5c): quarantine.
         """
+        if int(block.dst_verifier_rank) != self.verifier_rank:
+            # A misrouted / M:N block: seats are only meaningful within the
+            # owning verifier, so a foreign block's pool_indices would land in
+            # unrelated local seats.
+            raise RuntimeError(
+                "enumeration block routed to the wrong verifier: "
+                f"dst_verifier_rank={block.dst_verifier_rank} "
+                f"verifier_rank={self.verifier_rank} "
+                f"src_drafter_rank={block.src_drafter_rank} "
+                f"batch_size={block.batch_size}"
+            )
         if int(block.num_steps) != self.num_steps or int(block.fanout) != self.fanout:
             raise RuntimeError(
                 "enumeration block dims differ from the buffer's config "
@@ -112,33 +121,32 @@ class DecoupledEnumBuffer:
                 f"coincide): block=({block.num_steps}, {block.fanout}) "
                 f"buffer=({self.num_steps}, {self.fanout})"
             )
-        plan = plan_landing(block, slot_table, verifier_rank=self.verifier_rank)
-        if not plan.writes:
+        block.validate()  # parallel-array shape, unique pool_indices >= 1
+        if not block.pool_indices:
             return
+        max_pool_idx = max(int(pool_idx) for pool_idx in block.pool_indices)
+        if max_pool_idx >= self.seats:
+            # validate() cannot know this buffer's seat count; a peer echoing a
+            # seat we never announced must not corrupt an unrelated seat.
+            raise RuntimeError(
+                "enumeration block pool_idx exceeds the seat table: "
+                f"pool_idx={max_pool_idx} seats={self.seats} "
+                f"src_drafter_rank={block.src_drafter_rank}"
+            )
 
         # Reshape the block's flat token tuple once (C-order, so rows_host[i] ==
-        # block.row_tokens(i)); select survivors; blocking H2D from pageable host
-        # (the copy stream + pinned staging arrive in phase 6.3).
+        # block.row_tokens(i)); blocking H2D from pageable host (the copy stream
+        # + pinned staging arrive in phase 6.3).
         pool_indices = torch.tensor(
-            [w.pool_idx for w in plan.writes], dtype=torch.int64, device=self.device
+            block.pool_indices, dtype=torch.int64, device=self.device
         )
-        rows_host = torch.from_numpy(
+        rows = torch.from_numpy(
             np.asarray(block.tokens, dtype=np.int64).reshape(
                 block.batch_size, block.row_stride
             )
-        )
-        if len(plan.writes) == block.batch_size:
-            rows_selected = rows_host  # nothing dropped; row order preserved
-        else:
-            row_indices = torch.tensor(
-                [w.row_index for w in plan.writes], dtype=torch.int64
-            )
-            rows_selected = rows_host[row_indices]
-        rows = rows_selected.to(device=self.device)
+        ).to(device=self.device)
         base_committed_lens = torch.tensor(
-            [w.base_committed_len for w in plan.writes],
-            dtype=torch.int64,
-            device=self.device,
+            block.base_committed_lens, dtype=torch.int64, device=self.device
         )
 
         slot = self._write_slot

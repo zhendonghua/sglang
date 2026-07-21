@@ -38,21 +38,24 @@ def _control_msg(rid="r", drafter_rank=0) -> DraftMeshMessage:
         dst_drafter_rank=drafter_rank,
         sync_messages=[
             DraftSync(
-                request_id=rid, src_verifier_rank=0, dst_drafter_rank=drafter_rank
+                request_id=rid,
+                src_verifier_rank=0,
+                dst_drafter_rank=drafter_rank,
+                req_pool_idx=1,
             )
         ],
     )
     return DraftMeshMessage.from_control_batch(batch)
 
 
-def _enum_msg(rid="r", verifier_rank=0, tok=7) -> DraftMeshMessage:
+def _enum_msg(pool_idx=1, verifier_rank=0, tok=7) -> DraftMeshMessage:
     # Minimal K=1, F=1 block: row_stride = (K+1)*F*K = 2, one row of 2 token ids.
     block = DraftEnumerationBufferBatch(
         src_drafter_rank=0,
         dst_verifier_rank=verifier_rank,
         num_steps=1,
         fanout=1,
-        rids=[rid],
+        pool_indices=[pool_idx],
         base_committed_lens=[0],
         tokens=(tok, tok + 1),
     )
@@ -126,13 +129,13 @@ class TestFakeTransport(CustomTestCase):
         self.assertEqual(got.message_type, DraftMeshMessageType.CONTROL_BATCH)
         self.assertEqual(got.control_batch.sync_messages[0].request_id, "r0")
 
-        b.send(0, _enum_msg(rid="r0", tok=42))
+        b.send(0, _enum_msg(pool_idx=4, tok=42))
         got2 = a.try_recv()
         self.assertIsNotNone(got2)
         self.assertEqual(
             got2.message_type, DraftMeshMessageType.ENUMERATION_BUFFER_BATCH
         )
-        self.assertEqual(got2.enumeration_buffer_batch.rids[0], "r0")
+        self.assertEqual(got2.enumeration_buffer_batch.pool_indices, [4])
         self.assertEqual(got2.enumeration_buffer_batch.tokens[0], 42)
 
     def test_try_recv_empty_returns_none(self):
