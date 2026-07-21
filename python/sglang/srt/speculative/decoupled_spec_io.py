@@ -171,6 +171,9 @@ class DraftEnumerationBufferBatch:
     base_committed_lens: list[int] = field(default_factory=list)
     tokens: tuple[int, ...] = ()
     rids: list[str] = field(default_factory=list)
+    # Drafter-side time.time() at submit; debug-profile latency only (both
+    # processes share the host clock). None when profiling is off.
+    sent_unix_ts: Optional[float] = None
 
     @property
     def row_stride(self) -> int:

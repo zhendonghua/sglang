@@ -350,6 +350,10 @@ class Envs:
     # enumeration round. Adds a device sync at every phase boundary, so the
     # round itself gets slower -- debug instrumentation only.
     SGLANG_DEBUG_DECOUPLED_DRAFT_PROFILE = EnvBool(False)
+    # Decoupled spec: verifier-side round timeline (wall between rounds,
+    # control-plane send, arrival wait, block transport latency). Pure host
+    # timestamps -- cheap, but debug instrumentation only.
+    SGLANG_DEBUG_DECOUPLED_VERIFY_PROFILE = EnvBool(False)
 
     # Scheduler: memory leak test
     SGLANG_TEST_RETRACT = EnvBool(False)

@@ -133,6 +133,22 @@ class DecoupledVerifyManager:
         self.enum_round_ct = 0
         self.enum_hit_ct = 0
         self.sync_wait_timeout_ct = 0
+        # Round-timeline profile (SGLANG_DEBUG_DECOUPLED_VERIFY_PROFILE): the
+        # verify round seen from this hook. Per on_batch_result call:
+        #   loop_ms = entry - previous exit  (verify forward + batch-result +
+        #             scheduling, i.e. everything outside this hook)
+        #   ctl_ms  = control-plane collect + submit
+        #   wait_ms = arrival-board wait
+        # transport_ms accumulates (land_time - block.sent_unix_ts) from the
+        # IPC thread (same host clock across the two processes).
+        self._profile = envs.SGLANG_DEBUG_DECOUPLED_VERIFY_PROFILE.get()
+        self._prof_last_exit: Optional[float] = None
+        self._prof_round_ct = 0
+        self._prof_loop_ms = 0.0
+        self._prof_ctl_ms = 0.0
+        self._prof_wait_ms = 0.0
+        self._prof_transport_ms = 0.0
+        self._prof_transport_ct = 0
         # Per-round bound on waiting for the next block: the deterministic
         # sync-mode pacing by default; 0 = pure async pacing (never stall the
         # verifier on the drafter; late blocks fall back).
@@ -154,7 +170,7 @@ class DecoupledVerifyManager:
         self.ipc_thread = VerifierIpcThread(
             transport=transport,
             enum_buffer=verify_worker.enum_buffer,
-            on_land=self.arrival_board.record,
+            on_land=self._on_block_landed,
         )
         self.ipc_thread.start()
 
@@ -251,6 +267,14 @@ class DecoupledVerifyManager:
             self.scripted_drafter.close()
         self.ipc_thread.close()
 
+    def _on_block_landed(self, block: DraftEnumerationBufferBatch) -> None:
+        if self._profile and block.sent_unix_ts is not None:
+            # Accumulated from the IPC thread; float add races with the
+            # scheduler-thread reader are tolerable for debug averages.
+            self._prof_transport_ms += 1000.0 * (time.time() - block.sent_unix_ts)
+            self._prof_transport_ct += 1
+        self.arrival_board.record(block)
+
     def on_batch_result(self, batch: ScheduleBatch) -> None:
         """Forward this round's lifecycle controls, then pace the next round.
 
@@ -259,6 +283,7 @@ class DecoupledVerifyManager:
         """
         if not batch.reqs:
             return
+        t_in = time.monotonic() if self._profile else 0.0
         control_batch = DraftControlBatch(dst_drafter_rank=self.dst_drafter_rank)
         expected: dict[int, int] = {}
         for req in batch.reqs:
@@ -270,10 +295,34 @@ class DecoupledVerifyManager:
         ):
             self.ipc_thread.submit_control_batch(control_batch)
         self._account_select_hits(batch)
+        t_wait = time.monotonic() if self._profile else 0.0
         if expected and self.arrival_wait_s > 0:
             arrived = self.arrival_board.wait_for(expected, self.arrival_wait_s)
             if not arrived:
                 self.sync_wait_timeout_ct += 1
+        if self._profile:
+            t_out = time.monotonic()
+            if self._prof_last_exit is not None:
+                self._prof_round_ct += 1
+                self._prof_loop_ms += 1000.0 * (t_in - self._prof_last_exit)
+                self._prof_ctl_ms += 1000.0 * (t_wait - t_in)
+                self._prof_wait_ms += 1000.0 * (t_out - t_wait)
+                if self._prof_round_ct % 200 == 0:
+                    ct = self._prof_round_ct
+                    logger.info(
+                        "decoupled verify round timeline: ct=%d wall_ms=%.2f | "
+                        "loop(verify+sched)=%.2f ctl=%.2f wait=%.2f | "
+                        "block transport+land=%.2f (n=%d)",
+                        ct,
+                        (self._prof_loop_ms + self._prof_ctl_ms + self._prof_wait_ms)
+                        / ct,
+                        self._prof_loop_ms / ct,
+                        self._prof_ctl_ms / ct,
+                        self._prof_wait_ms / ct,
+                        self._prof_transport_ms / max(1, self._prof_transport_ct),
+                        self._prof_transport_ct,
+                    )
+            self._prof_last_exit = t_out
 
     def _collect_req_controls(
         self,

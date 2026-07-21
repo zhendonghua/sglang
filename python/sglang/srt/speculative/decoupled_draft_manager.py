@@ -76,6 +76,7 @@ class DecoupledDraftManager:
         self.ipc_thread.start()
         self._round_ct = 0
         self._round_time_s = 0.0
+        self._push_time_s = 0.0
 
         self.ipc_block_pool = None
         if data_transport == "cuda_ipc":
@@ -150,10 +151,11 @@ class DecoupledDraftManager:
             self._round_time_s += time.monotonic() - round_start
             if self._round_ct % 200 == 0:
                 logger.info(
-                    "decoupled drafter rounds: ct=%d avg_ms=%.1f last_bs=%d "
-                    "fast=%d slow=%d",
+                    "decoupled drafter rounds: ct=%d avg_ms=%.1f push_ms=%.2f "
+                    "last_bs=%d fast=%d slow=%d",
                     self._round_ct,
                     1000.0 * self._round_time_s / self._round_ct,
+                    1000.0 * self._push_time_s / self._round_ct,
                     len(draft_keys),
                     self.engine.hit_ct,
                     self.engine.miss_ct,
@@ -165,6 +167,7 @@ class DecoupledDraftManager:
                     )
             if packed is None:
                 continue
+            push_start = time.monotonic()
             if self.ipc_block_pool is not None:
                 # CUDA IPC data plane: D2D into the shared pool; the shm flag
                 # bump after the device sync is the arrival signal.
@@ -173,6 +176,7 @@ class DecoupledDraftManager:
                     base_committed_lens=packed["base_committed_lens"],
                     units=packed["units_device"],
                 )
+                self._push_time_s += time.monotonic() - push_start
                 continue
             self.ipc_thread.submit_draft_results(
                 DraftEnumerationBufferBatch(
@@ -183,8 +187,10 @@ class DecoupledDraftManager:
                     pool_indices=packed["pool_indices"],
                     base_committed_lens=packed["base_committed_lens"],
                     tokens=tuple(packed["units_device"].to("cpu").reshape(-1).tolist()),
+                    sent_unix_ts=time.time(),
                 )
             )
+            self._push_time_s += time.monotonic() - push_start
 
     def close(self) -> None:
         self.ipc_thread.close()
