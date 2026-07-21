@@ -70,6 +70,13 @@ def _parse_args() -> argparse.Namespace:
         help="Per-phase breakdown via SGLANG_DEBUG_DECOUPLED_DRAFT_PROFILE "
         "(adds phase-boundary device syncs; wall time will be inflated).",
     )
+    parser.add_argument(
+        "--torch-profile-trace",
+        type=str,
+        default=None,
+        help="Wrap 3 post-warmup rounds in torch.profiler and export a chrome "
+        "trace to this path; also prints the top ops by CPU time.",
+    )
     return parser.parse_args()
 
 
@@ -164,6 +171,30 @@ def main() -> None:
         delta_len=delta_len,
         rounds=args.rounds,
     )
+
+    if args.torch_profile_trace is not None:
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ]
+        ) as prof:
+            _run_rounds(
+                engine=engine,
+                keys=keys,
+                rng=rng,
+                vocab_size=vocab_size,
+                delta_len=delta_len,
+                rounds=3,
+            )
+        prof.export_chrome_trace(args.torch_profile_trace)
+        logger.info(
+            "torch profiler top ops:\n%s",
+            prof.key_averages().table(
+                sort_by="self_cpu_time_total", row_limit=25, max_name_column_width=60
+            ),
+        )
+        logger.info("chrome trace written to %s", args.torch_profile_trace)
 
     round_ms.sort()
     n = len(round_ms)
