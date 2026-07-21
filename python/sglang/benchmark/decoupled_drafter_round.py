@@ -194,18 +194,34 @@ def _compare_engines(
     mismatch_rounds = 0
     for r in range(args.rounds):
         units = {}
+        paths = {}
+        lens = {}
         for name, engine in engines.items():
             if delta is not None:
                 engine.apply_commit(key, delta)
+            hits_before = engine.hit_ct
             packed = engine.draft_round([key])
+            paths[name] = "fast" if engine.hit_ct > hits_before else "slow"
+            lens[name] = packed["base_committed_lens"][0]
             units[name] = packed["units_device"][0].cpu().tolist()
         if units["fast"] != units["slow"]:
             mismatch_rounds += 1
+            guess_cols = {
+                name: [u[c][0][0] for c in range(len(u))] for name, u in units.items()
+            }
+            logger.info(
+                "round %d MISMATCH paths=%s lens=%s guess_col fast=%s slow=%s",
+                r,
+                paths,
+                lens,
+                guess_cols["fast"],
+                guess_cols["slow"],
+            )
             for case, (uf_row, us_row) in enumerate(zip(units["fast"], units["slow"])):
                 for f, (uf, us) in enumerate(zip(uf_row, us_row)):
                     if uf != us:
                         logger.info(
-                            "round %d MISMATCH case=%d f=%d fast=%s slow=%s",
+                            "round %d first diff case=%d f=%d fast=%s slow=%s",
                             r,
                             case,
                             f,
