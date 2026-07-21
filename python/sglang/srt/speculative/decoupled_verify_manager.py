@@ -54,10 +54,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Sync-mode bound on waiting for the next enumeration block. Generous vs a
-# real drafter round (a few ms); on expiry the round simply falls back.
-_SYNC_ARRIVAL_TIMEOUT_S = 0.2
-
 _LOOPBACK_VERIFIER_ENDPOINT = "loopback://decoupled-spec-verifier"
 _LOOPBACK_DRAFTER_ENDPOINT = "loopback://decoupled-spec-drafter"
 
@@ -137,6 +133,10 @@ class DecoupledVerifyManager:
         self.enum_round_ct = 0
         self.enum_hit_ct = 0
         self.sync_wait_timeout_ct = 0
+        # Per-round bound on waiting for the next block: the deterministic
+        # sync-mode pacing by default; 0 = pure async pacing (never stall the
+        # verifier on the drafter; late blocks fall back).
+        self.arrival_wait_s = envs.SGLANG_DECOUPLED_ENUM_WAIT_MS.get() / 1000.0
 
         self.scripted_drafter: Optional[ScriptedFakeDrafter] = None
         loopback_mode = envs.SGLANG_TEST_DECOUPLED_LOOPBACK.get()
@@ -270,8 +270,8 @@ class DecoupledVerifyManager:
         ):
             self.ipc_thread.submit_control_batch(control_batch)
         self._account_select_hits(batch)
-        if expected:
-            arrived = self.arrival_board.wait_for(expected, _SYNC_ARRIVAL_TIMEOUT_S)
+        if expected and self.arrival_wait_s > 0:
+            arrived = self.arrival_board.wait_for(expected, self.arrival_wait_s)
             if not arrived:
                 self.sync_wait_timeout_ct += 1
 

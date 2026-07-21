@@ -341,6 +341,11 @@ class Envs:
     # lock). Value = scripted behavior: "garbage" (valid stamps, chains that
     # never match) or "stale" (stamps always one behind). None = off.
     SGLANG_TEST_DECOUPLED_LOOPBACK = EnvStr(None)
+    # Decoupled spec: bound (ms) on the verifier's per-round wait for the next
+    # enumeration block. The default is the deterministic sync-mode pacing; 0
+    # never waits (pure async pacing -- the cross-engine overlap form: a late
+    # block only costs a fallback round, never correctness).
+    SGLANG_DECOUPLED_ENUM_WAIT_MS = EnvInt(200)
 
     # Scheduler: memory leak test
     SGLANG_TEST_RETRACT = EnvBool(False)
