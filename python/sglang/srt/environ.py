@@ -346,6 +346,10 @@ class Envs:
     # never waits (pure async pacing -- the cross-engine overlap form: a late
     # block only costs a fallback round, never correctness).
     SGLANG_DECOUPLED_ENUM_WAIT_MS = EnvInt(200)
+    # Decoupled spec: per-phase host-time breakdown of the drafter's
+    # enumeration round. Adds a device sync at every phase boundary, so the
+    # round itself gets slower -- debug instrumentation only.
+    SGLANG_DEBUG_DECOUPLED_DRAFT_PROFILE = EnvBool(False)
 
     # Scheduler: memory leak test
     SGLANG_TEST_RETRACT = EnvBool(False)

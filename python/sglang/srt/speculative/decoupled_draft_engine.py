@@ -25,12 +25,14 @@ listed future optimization).
 from __future__ import annotations
 
 import logging
+import time
 from array import array
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -61,6 +63,50 @@ class _ScratchTreeCache(SimpleNamespace):
 
     def evict(self, params: EvictParams):
         pass
+
+
+class _RoundProfiler:
+    """Per-phase host-time accumulator for the enumeration round.
+
+    Syncs the device at every mark so each phase's wall time is attributed
+    exactly -- which also serializes host and GPU work. Numbers are for
+    relative breakdown, not absolute round latency (debug only).
+    """
+
+    def __init__(self, *, enabled: bool) -> None:
+        self.enabled = enabled
+        self.round_ct = 0
+        self.phase_ms: dict[str, float] = {}
+        self._t_last = 0.0
+
+    def start_round(self) -> None:
+        if not self.enabled:
+            return
+        torch.cuda.synchronize()
+        self.round_ct += 1
+        self._t_last = time.monotonic()
+
+    def mark(self, phase: str) -> None:
+        if not self.enabled:
+            return
+        torch.cuda.synchronize()
+        now = time.monotonic()
+        self.phase_ms[phase] = self.phase_ms.get(phase, 0.0) + 1000.0 * (
+            now - self._t_last
+        )
+        self._t_last = now
+
+    def summary(self) -> str:
+        if self.round_ct == 0:
+            return "no profiled rounds"
+        parts = [
+            f"{phase}={ms / self.round_ct:.2f}"
+            for phase, ms in sorted(
+                self.phase_ms.items(), key=lambda kv: kv[1], reverse=True
+            )
+        ]
+        total = sum(self.phase_ms.values()) / self.round_ct
+        return f"rounds={self.round_ct} total_ms={total:.2f} | " + " ".join(parts)
 
 
 class _DraftReqState:
@@ -96,6 +142,9 @@ class EnumDraftEngine:
         # Greedy, never finishing on its own; lifecycle is DraftSync/DraftClose.
         self._sampling_params = SamplingParams(temperature=0, max_new_tokens=1 << 30)
         self._states: dict[DraftReqKey, _DraftReqState] = {}
+        self.profiler = _RoundProfiler(
+            enabled=envs.SGLANG_DEBUG_DECOUPLED_DRAFT_PROFILE.get()
+        )
 
     # ------------------------------------------------------------------ #
     # Lifecycle (control plane)
@@ -147,10 +196,12 @@ class EnumDraftEngine:
         states = [self._states[key] for key in keys]
         scratch_batches: list[ScheduleBatch] = []
         scratch_slots: list[torch.Tensor] = []
+        self.profiler.start_round()
         try:
             return self._draft_round_inner(states, scratch_batches, scratch_slots)
         finally:
             self._free_scratch(scratch_batches, scratch_slots)
+            self.profiler.mark("free")
 
     def _draft_round_inner(
         self,
@@ -167,9 +218,10 @@ class EnumDraftEngine:
         advance_batch, advance_slots = self._extend_batch(
             token_lists=[state.committed_tokens for state in states],
             prefix_slots=[state.committed_slots for state in states],
+            tag="advance",
         )
         scratch_batches.append(advance_batch)
-        logits = self._forward(advance_batch)
+        logits = self._forward(advance_batch, tag="advance")
         node_logits.append(logits)
         # Newly written KV joins the committed prefix (kept across rounds).
         offset = 0
@@ -182,6 +234,7 @@ class EnumDraftEngine:
                 ]
             )
             offset += new_len
+        self.profiler.mark("commit_slots")
 
         # -- Phase 2: backbone c_1..c_K + per-node top-F guesses ------------
         # guesses[a]: [bs, F] int64; backbone_tokens[j]: [bs] (c_{j+1}).
@@ -195,17 +248,20 @@ class EnumDraftEngine:
                     for i, state in enumerate(states)
                 ],
                 prefix_slots=[state.committed_slots for state in states],
+                tag="backbone",
             )
             scratch_batches.append(backbone_batch)
             scratch_slots.append(first_slots)
             backbone_slot_steps.append(first_slots)
-            logits = self._forward(backbone_batch)
+            logits = self._forward(backbone_batch, tag="backbone")
             node_logits.append(logits)
             guesses.append(torch.topk(logits, fanout, dim=-1).indices)
             for _ in range(num_steps - 1):
                 next_tokens = guesses[-1][:, 0]
                 backbone_tokens.append(next_tokens)
-                logits, step_slots = self._decode_step(backbone_batch, next_tokens)
+                logits, step_slots = self._decode_step(
+                    backbone_batch, next_tokens, tag="backbone"
+                )
                 scratch_slots.append(step_slots)
                 backbone_slot_steps.append(step_slots)
                 node_logits.append(logits)
@@ -234,16 +290,20 @@ class EnumDraftEngine:
                     branch_prefix_slots.append(
                         torch.cat([state.committed_slots, backbone_slots_i[:case]])
                     )
+        self.profiler.mark("branch_lists")
         branch_batch, branch_first_slots = self._extend_batch(
             token_lists=branch_token_lists,
             prefix_slots=branch_prefix_slots,
+            tag="branch",
         )
         scratch_batches.append(branch_batch)
         scratch_slots.append(branch_first_slots)
-        logits = self._forward(branch_batch)
+        logits = self._forward(branch_batch, tag="branch")
         chain_steps: list[torch.Tensor] = [logits.argmax(dim=-1)]
         for _ in range(num_steps - 1):
-            logits, step_slots = self._decode_step(branch_batch, chain_steps[-1])
+            logits, step_slots = self._decode_step(
+                branch_batch, chain_steps[-1], tag="branch"
+            )
             scratch_slots.append(step_slots)
             chain_steps.append(logits.argmax(dim=-1))
 
@@ -253,6 +313,7 @@ class EnumDraftEngine:
         chains = torch.stack(chain_steps, dim=1).view(bs, num_cases, fanout, num_steps)
         guesses_col = guesses_stack.unsqueeze(-1)  # [bs, K+1, F, 1]
         units_device = torch.cat([guesses_col, chains], dim=-1)  # [bs, K+1, F, K+1]
+        self.profiler.mark("pack")
         return {
             "pool_indices": [state.req_pool_idx for state in states],
             "base_committed_lens": [len(state.committed_tokens) for state in states],
@@ -268,6 +329,7 @@ class EnumDraftEngine:
         *,
         token_lists: list[list[int]],
         prefix_slots: list[torch.Tensor],
+        tag: str,
     ) -> tuple[ScheduleBatch, torch.Tensor]:
         """Extend each row's tokens beyond its (slot-shared) prefix.
 
@@ -301,24 +363,28 @@ class EnumDraftEngine:
                 batch.device, non_blocking=True
             )
             batch.prefill_input_ids_cpu = None
+        self.profiler.mark(f"{tag}_build")
         return batch, batch.out_cache_loc
 
-    def _forward(self, batch: ScheduleBatch) -> torch.Tensor:
+    def _forward(self, batch: ScheduleBatch, *, tag: str) -> torch.Tensor:
         forward_batch = ForwardBatch.init_new(
             batch, self.model_runner, return_hidden_states_before_norm=False
         )
         logits_output = self.model_runner.forward(forward_batch).logits_output
+        self.profiler.mark(f"{tag}_fwd")
         return logits_output.next_token_logits
 
     def _decode_step(
-        self, batch: ScheduleBatch, input_tokens: torch.Tensor
+        self, batch: ScheduleBatch, input_tokens: torch.Tensor, *, tag: str
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch.input_ids = input_tokens.to(torch.int64)
         batch.prepare_for_decode()
+        self.profiler.mark(f"{tag}_step_prep")
         forward_batch = ForwardBatch.init_new(
             batch, self.model_runner, return_hidden_states_before_norm=False
         )
         logits_output = self.model_runner.forward(forward_batch).logits_output
+        self.profiler.mark(f"{tag}_step_fwd")
         return logits_output.next_token_logits, batch.out_cache_loc
 
     def _free_scratch(

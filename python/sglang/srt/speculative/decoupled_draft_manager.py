@@ -155,6 +155,11 @@ class DecoupledDraftManager:
                     1000.0 * self._round_time_s / self._round_ct,
                     len(draft_keys),
                 )
+                if self.engine.profiler.enabled:
+                    logger.info(
+                        "decoupled drafter round breakdown: %s",
+                        self.engine.profiler.summary(),
+                    )
             if packed is None:
                 continue
             if self.ipc_block_pool is not None:
