@@ -40,10 +40,22 @@ def _row(units):
     return flat.reshape(ROW_WIDTH)
 
 
-def _select(rows, stamps, bonus, cases, bases):
+def _select(rows, stamps, bonus, cases, bases, rows_prev=None, stamps_prev=None):
+    """Drive the two-generation select; the second generation defaults to an
+    unwritten (sentinel-stamped) block."""
+    newest = torch.stack(rows)
+    previous = (
+        torch.stack(rows_prev) if rows_prev is not None else torch.zeros_like(newest)
+    )
+    stamps_newest = torch.tensor(stamps, dtype=torch.int64)
+    stamps_previous = (
+        torch.tensor(stamps_prev, dtype=torch.int64)
+        if stamps_prev is not None
+        else torch.full_like(stamps_newest, -1)
+    )
     return select_enum_units(
-        torch.stack(rows),
-        torch.tensor(stamps, dtype=torch.int64),
+        torch.stack([newest, previous], dim=1),
+        torch.stack([stamps_newest, stamps_previous], dim=1),
         bonus_tokens=torch.tensor(bonus, dtype=torch.int64),
         prev_accept_lens=torch.tensor(cases, dtype=torch.int64),
         base_committed_lens=torch.tensor(bases, dtype=torch.int64),
@@ -106,6 +118,26 @@ class TestSelectEnumUnits(CustomTestCase):
         row = _row({(2, 0): [77, 20, 21]})
         selected, hits = _select([row], stamps=[42], bonus=[77], cases=[9], bases=[42])
         self.assertEqual(hits.tolist(), [True])  # clamped to case 2, which matches
+        self.assertEqual(selected[0].tolist(), [77, 20, 21])
+
+    def test_previous_generation_serves_when_newer_block_landed(self):
+        # Regression (first cross-process e2e, 0-hit): the block serving THIS
+        # round was enumerated two commits back, but the last commit already
+        # pushed a newer block into the seat. The select must match the
+        # expected base against BOTH stamped generations and pick the older
+        # one, or sync pacing degrades every round to a staleness fallback.
+        serving = _row({(0, 0): [77, 20, 21]})
+        newer = _row({(0, 0): [55, 30, 31]})
+        selected, hits = _select(
+            [newer],
+            stamps=[50],  # the newer push (|P_{r-1}|)
+            bonus=[77],
+            cases=[0],
+            bases=[42],  # this round expects the older base (|P_{r-2}|)
+            rows_prev=[serving],
+            stamps_prev=[42],
+        )
+        self.assertEqual(hits.tolist(), [True])
         self.assertEqual(selected[0].tolist(), [77, 20, 21])
 
     def test_mixed_batch_rows_are_independent(self):

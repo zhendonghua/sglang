@@ -115,26 +115,32 @@ def select_enum_units(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pure GPU select: (selected [bs, unit_width], hits [bs] bool). No host sync.
 
-    ``rows`` / ``stamps`` are the seat-gathered enumeration rows
-    ([bs, num_cases * fanout * unit_width]) and their freshness stamps. Two
-    steps: pick the (accept_case, bonus_guess) unit, then judge -- a row is a
-    hit iff its stamp equals the expected base (fresh) AND the real bonus is
-    among the case's F guesses (unit element 0). Miss rows become the
-    bonus-seeded fallback ``[bonus, bonus, ...]``: the root is the real bonus,
-    and the junk tail is safe because verify only accepts target-agreeing
-    tokens -- the row degrades to a plain 1-token decode.
+    ``rows`` / ``stamps`` are the seat-gathered enumeration generations
+    ([bs, gen_count, num_cases * fanout * unit_width] and [bs, gen_count]):
+    each seat keeps its two newest stamped blocks, because the block serving
+    THIS round (enumerated two commits back) coexists with the one the last
+    commit already pushed. Three steps: pick the generation whose stamp equals
+    the expected base (fresh), then the (accept_case, bonus_guess) unit within
+    it -- a hit iff fresh AND the real bonus is among the case's F guesses
+    (unit element 0). Miss rows become the bonus-seeded fallback
+    ``[bonus, bonus, ...]``: the root is the real bonus, and the junk tail is
+    safe because verify only accepts target-agreeing tokens -- the row
+    degrades to a plain 1-token decode.
     """
-    bs = rows.shape[0]
-    units = rows.view(bs, num_cases, fanout, unit_width)
+    bs, gen_count = stamps.shape
+    units = rows.view(bs, gen_count, num_cases, fanout, unit_width)
 
     bonus_tokens = bonus_tokens.to(torch.int64)
-    fresh = stamps.eq(base_committed_lens)
+    gen_matches = stamps.eq(base_committed_lens.unsqueeze(1))  # [bs, gen_count]
+    fresh = gen_matches.any(dim=1)
+    # First matching generation; 0 (overwritten by the fallback) when none.
+    gen_indices = gen_matches.to(torch.int64).argmax(dim=1)
     # Clamp guards a protocol bug from turning into a device-side OOB; a wrong
     # case then simply fails the guess match and falls back.
     cases = prev_accept_lens.clamp(min=0, max=num_cases - 1)
 
     batch_arange = torch.arange(bs, device=rows.device)
-    case_units = units[batch_arange, cases]  # [bs, F, unit_width]
+    case_units = units[batch_arange, gen_indices, cases]  # [bs, F, unit_width]
     guesses = case_units[:, :, 0]  # [bs, F]
     guess_matches = guesses.eq(bonus_tokens.unsqueeze(1))  # [bs, F]
     hits = fresh & guess_matches.any(dim=1)

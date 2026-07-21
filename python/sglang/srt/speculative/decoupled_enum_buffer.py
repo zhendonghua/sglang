@@ -68,6 +68,14 @@ class DecoupledEnumBuffer:
         # req_to_token.shape[0] == max_running + 1, so seat 0 stays the harmless
         # cuda-graph padding row; never size to bare max_running.
         self.seats = int(req_to_token_pool.req_to_token.shape[0])
+        # Each seat holds the TWO newest stamped blocks (generations). The block
+        # serving round r was enumerated two commits back (stamp |P_{r-2}|),
+        # while the commit of round r-1 has already pushed the next block
+        # (stamp |P_{r-1}|): with one generation the newer push would clobber
+        # the block round r selects from, turning every round into a staleness
+        # fallback under sync pacing. gather() returns both; the select matches
+        # stamps against the expected base and picks the right generation.
+        self.gen_count = 2
         # Double-buffer (mamba idiom, memory_pool.py:849) is the phase 6.3 form;
         # buf_count is always 1 here (enable_overlap is rejected above).
         self.buf_count = 2 if enable_overlap else 1
@@ -78,13 +86,29 @@ class DecoupledEnumBuffer:
         # int32 is numerically enough but would force an up-cast. Not
         # req_to_token's int32, which is a KV-slot index pool, not vocab ids.
         self.enum_tokens = [
-            torch.zeros((self.seats, self.row_width), dtype=torch.int64, device=device)
+            torch.zeros(
+                (self.seats, self.gen_count, self.row_width),
+                dtype=torch.int64,
+                device=device,
+            )
             for _ in range(self.buf_count)
         ]
-        # Per-seat freshness stamp; starts at the sentinel so an unwritten seat
-        # falls back. int64 to match the committed length it is compared against.
+        # Per-(seat, generation) freshness stamp; starts at the sentinel so an
+        # unwritten generation falls back. int64 to match the committed length
+        # it is compared against.
         self.enum_base_committed_lens = [
-            torch.full((self.seats,), _STAMP_EMPTY, dtype=torch.int64, device=device)
+            torch.full(
+                (self.seats, self.gen_count),
+                _STAMP_EMPTY,
+                dtype=torch.int64,
+                device=device,
+            )
+            for _ in range(self.buf_count)
+        ]
+        # Which generation was written last per seat; the next land overwrites
+        # the OTHER one, so the previous block survives exactly one more push.
+        self.enum_last_gen = [
+            torch.zeros((self.seats,), dtype=torch.int64, device=device)
             for _ in range(self.buf_count)
         ]
 
@@ -153,17 +177,24 @@ class DecoupledEnumBuffer:
         )
 
         slot = self._write_slot
-        self.enum_tokens[slot][pool_indices] = rows
-        self.enum_base_committed_lens[slot][pool_indices] = base_committed_lens
+        # Write the generation NOT written last, then mark it newest: the
+        # previous block survives exactly one more push (see gen_count above).
+        write_gens = 1 - self.enum_last_gen[slot][pool_indices]
+        self.enum_tokens[slot][pool_indices, write_gens] = rows
+        self.enum_base_committed_lens[slot][
+            pool_indices, write_gens
+        ] = base_committed_lens
+        self.enum_last_gen[slot][pool_indices] = write_gens
 
     def gather(
         self, req_pool_indices: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Gather this batch's rows + freshness stamps from the read-side slot:
-        (rows [B, (K+1)*F*(K+1)], base_committed_lens [B]). The verify forward
-        (phase 4a) compares base_committed_lens against the live committed
-        length for fresh-vs-fallback, then selects the winning [guess, chain]
-        unit by (accept_case, bonus_guess).
+        (rows [B, gen_count, (K+1)*F*(K+1)], base_committed_lens [B, gen_count]).
+        The verify forward (phase 4a) matches base_committed_lens against the
+        live expected base to pick the serving generation (fresh-vs-fallback),
+        then selects the winning [guess, chain] unit by (accept_case,
+        bonus_guess).
         """
         slot = self._read_slot
         rows = self.enum_tokens[slot][req_pool_indices]
@@ -171,11 +202,11 @@ class DecoupledEnumBuffer:
         return rows, base_committed_lens
 
     def reset_slot(self, pool_idx: int) -> None:
-        # Invalidate a seat's stamp when it is (re)assigned, so the reused seat
+        # Invalidate a seat's stamps when it is (re)assigned, so the reused seat
         # falls back until its new occupant's own block lands. Called by the
         # scheduler at prefill alloc / retraction re-admit.
         for slot in range(self.buf_count):
-            self.enum_base_committed_lens[slot][pool_idx] = _STAMP_EMPTY
+            self.enum_base_committed_lens[slot][pool_idx, :] = _STAMP_EMPTY
 
     def swap(self) -> None:
         # Advance the write/read double-buffer at a round boundary; no-op under

@@ -64,49 +64,75 @@ def _block(
     )
 
 
+def _seat_stamped(rows, stamps, stamp):
+    """Return the row of the generation carrying ``stamp`` for batch entry 0."""
+    stamp_list = stamps[0].tolist()
+    return rows[0][stamp_list.index(stamp)]
+
+
 class TestDecoupledEnumBufferLanding(CustomTestCase):
     def test_land_scatters_rows_and_stamps_by_pool_indices(self):
         # Routing rides in the block: row i lands in seat pool_indices[i], and
         # the flat C-order token tuple reshapes so the landed row equals
         # block.row_tokens(i). gather() must return exactly those rows/stamps
-        # for an arbitrary req_pool_indices order.
+        # (on the generation axis) for an arbitrary req_pool_indices order.
         buf = _buffer()
         block = _block([3, 5], [10, 20])
         buf.land(block)
 
         rows, stamps = buf.gather(torch.tensor([5, 3], dtype=torch.int64))
-        self.assertEqual(tuple(rows[0].tolist()), block.row_tokens(1))
-        self.assertEqual(tuple(rows[1].tolist()), block.row_tokens(0))
-        self.assertEqual(stamps.tolist(), [20, 10])
+        self.assertIn(20, stamps[0].tolist())
+        self.assertIn(10, stamps[1].tolist())
+        self.assertEqual(
+            tuple(_seat_stamped(rows[0:1], stamps[0:1], 20).tolist()),
+            block.row_tokens(1),
+        )
+        self.assertEqual(
+            tuple(_seat_stamped(rows[1:2], stamps[1:2], 10).tolist()),
+            block.row_tokens(0),
+        )
 
-    def test_unwritten_seat_gathers_negative_sentinel_stamp(self):
-        # The fallback contract for cold seats: a never-written seat's stamp is
-        # negative, so it can never equal a real (>= 0) committed length and the
-        # request falls back instead of consuming garbage.
+    def test_unwritten_seat_gathers_negative_sentinel_stamps(self):
+        # The fallback contract for cold seats: a never-written seat's stamps
+        # are negative in every generation, so they can never equal a real
+        # (>= 0) committed length and the request falls back.
         buf = _buffer()
         _rows, stamps = buf.gather(torch.tensor([1], dtype=torch.int64))
-        self.assertLess(int(stamps[0]), 0)
+        self.assertTrue(all(s < 0 for s in stamps[0].tolist()))
 
-    def test_reset_slot_invalidates_stamp_for_reused_seat(self):
+    def test_reset_slot_invalidates_all_generations_for_reused_seat(self):
         # Seat-reuse lifecycle: when the scheduler reassigns a seat it calls
-        # reset_slot, after which the previous occupant's landed block must no
-        # longer look fresh (stamp back to the sentinel).
+        # reset_slot, after which NO generation of the previous occupant's
+        # landed blocks may look fresh (stamps back to the sentinel).
         buf = _buffer()
         buf.land(_block([3], [10]))
+        buf.land(_block([3], [14]))
         buf.reset_slot(3)
         _rows, stamps = buf.gather(torch.tensor([3], dtype=torch.int64))
-        self.assertLess(int(stamps[0]), 0)
+        self.assertTrue(all(s < 0 for s in stamps[0].tolist()))
 
-    def test_later_block_overwrites_seat(self):
-        # One seat holds exactly the latest round's row: a new commit-driven
-        # block replaces both tokens and stamp (last write wins).
+    def test_two_newest_blocks_coexist_per_seat(self):
+        # Regression (first cross-process e2e, 0-hit): the block serving round
+        # r (stamp |P_{r-2}|) must survive the newer push from round r-1's
+        # commit (stamp |P_{r-1}|); only the THIRD push may evict it.
         buf = _buffer()
-        buf.land(_block([3], [10]))
-        fresh = _block([3], [14], tokens=tuple(range(100, 100 + 18)))
-        buf.land(fresh)
+        serving = _block([3], [10])
+        buf.land(serving)
+        newer = _block([3], [14], tokens=tuple(range(100, 100 + 18)))
+        buf.land(newer)
         rows, stamps = buf.gather(torch.tensor([3], dtype=torch.int64))
-        self.assertEqual(tuple(rows[0].tolist()), fresh.row_tokens(0))
-        self.assertEqual(stamps.tolist(), [14])
+        self.assertCountEqual(stamps[0].tolist(), [10, 14])
+        self.assertEqual(
+            tuple(_seat_stamped(rows, stamps, 10).tolist()), serving.row_tokens(0)
+        )
+        self.assertEqual(
+            tuple(_seat_stamped(rows, stamps, 14).tolist()), newer.row_tokens(0)
+        )
+        # A third push evicts the oldest (10), keeping 14 and 18.
+        third = _block([3], [18], tokens=tuple(range(200, 200 + 18)))
+        buf.land(third)
+        _rows, stamps = buf.gather(torch.tensor([3], dtype=torch.int64))
+        self.assertCountEqual(stamps[0].tolist(), [14, 18])
 
     def test_land_empty_block_is_noop(self):
         buf = _buffer()
