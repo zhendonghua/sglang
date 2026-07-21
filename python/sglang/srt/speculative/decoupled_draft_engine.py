@@ -130,68 +130,47 @@ class _DraftReqState:
         return self.committed_tokens[self.committed_slots.numel() :]
 
 
-class _RoundCarriers:
-    """Retained fast-path batches for one fixed key set.
+class _SeatCarrier:
+    """Retained fast-path pool rows + scatter template for ONE seat.
 
-    ``glue_batch``: bs*K one-token extend rows; row (i, g) re-materializes
-    backbone token c_{g+1} on top of committed + c_1..c_g. Prefixes are
-    slot-shared ACROSS ROWS OF THE SAME FORWARD: per layer, the batched KV
-    write precedes the attention read, and c_g's KV depends only on its own
-    row, so row g+1 reads row g's fresh KV exactly as a sequential chain
-    would.
+    ``glue_rows``: K one-token extend rows; row g re-materializes backbone
+    token c_{g+1} on top of committed + c_1..c_g. Prefixes are slot-shared
+    ACROSS ROWS OF THE SAME FORWARD: per layer, the batched KV write precedes
+    the attention read, and c_g's KV depends only on its own row, so row g+1
+    reads row g's fresh KV exactly as a sequential chain would.
 
-    ``branch_batch``: bs*(K+1)*F persistent decode rows; each round only
-    seq_lens and the pool-row tail entries move, then the K chain steps run
-    as plain decode (cuda-graph replays).
+    ``branch_rows``: (K+1)*F persistent decode rows; each round only seq_lens
+    and the pool-row tail entries move, then the K chain steps run as plain
+    decode (cuda-graph replays).
 
     Pool-row content is maintained incrementally: rows carry the committed
-    prefix up to ``synced_lens[i]``; the region past it is per-round scratch
+    prefix up to ``synced_len``; the region past it is per-round scratch
     mapping (delta slots, then backbone slots) and is rewritten every round.
+    Seats are independent so any hit subset of a batch can run the fast path
+    (per-seat mixing); rows live until the seat closes.
     """
 
     def __init__(
         self,
         *,
-        keys: tuple[DraftReqKey, ...],
-        glue_batch: ScheduleBatch,
-        branch_batch: ScheduleBatch,
-        synced_lens: list[int],
-        num_steps: int,
-        fanout: int,
-        device: torch.device,
+        glue_rows: torch.Tensor,  # [K] device
+        branch_rows: torch.Tensor,  # [(K+1)*F] device
+        glue_reqs: list,
+        branch_reqs: list,
+        synced_len: int,
+        tri_g: torch.Tensor,
+        br_r: torch.Tensor,
     ) -> None:
-        self.keys = keys
-        self.glue_batch = glue_batch
-        self.branch_batch = branch_batch
-        self.synced_lens = synced_lens
-        num_cases = num_steps + 1
-        rows_per_seat = num_cases * fanout
-        bs = len(keys)
-        glue_rows = glue_batch.req_pool_indices.view(bs, num_steps)
-        branch_rows = branch_batch.req_pool_indices.view(bs, rows_per_seat)
+        self.glue_rows = glue_rows
+        self.branch_rows = branch_rows
+        # Req stubs owning the pool rows (freed via ReqToTokenPool.free(req)).
+        self.glue_reqs = glue_reqs
+        self.branch_reqs = branch_reqs
+        self.synced_len = synced_len
         # All carrier rows sharing the committed prefix (delta broadcast).
-        self.all_rows = torch.cat([glue_rows, branch_rows], dim=1)  # [bs, K+R]
-        # Combined scatter template: glue triangle (row g needs c_1..c_g's
-        # slots at [L:L+g] INCLUSIVE -- fa3 extend reads the current token's
-        # own K/V through the page table too) + branch case prefixes (row
-        # (c, f) needs c_1..c_c's slots at [L:L+c); its own entry is written
-        # by alloc_for_decode). Entry j's value is backbone slot j.
-        tri_g = [g for g in range(num_steps) for j in range(g + 1)]
-        tri_j = [j for g in range(num_steps) for j in range(g + 1)]
-        br_r = [
-            c * fanout + f
-            for c in range(num_cases)
-            for f in range(fanout)
-            for j in range(c)
-        ]
-        br_j = [j for c in range(num_cases) for f in range(fanout) for j in range(c)]
-        tri_g_dev = torch.tensor(tri_g, dtype=torch.int64, device=device)
-        br_r_dev = torch.tensor(br_r, dtype=torch.int64, device=device)
-        self.comb_rows = torch.cat(
-            [glue_rows[:, tri_g_dev], branch_rows[:, br_r_dev]], dim=1
-        )  # [bs, T]
-        self.comb_j = torch.tensor(tri_j + br_j, dtype=torch.int64, device=device)
-        self.case_of_row = [c for c in range(num_cases) for _ in range(fanout)]
+        self.all_rows = torch.cat([glue_rows, branch_rows])
+        # Combined scatter rows (values/cols come from the engine templates).
+        self.comb_rows = torch.cat([glue_rows[tri_g], branch_rows[br_r]])
 
 
 class EnumDraftEngine:
@@ -218,8 +197,34 @@ class EnumDraftEngine:
         # Greedy, never finishing on its own; lifecycle is DraftSync/DraftClose.
         self._sampling_params = SamplingParams(temperature=0, max_new_tokens=1 << 30)
         self._states: dict[DraftReqKey, _DraftReqState] = {}
-        self._carriers: Optional[_RoundCarriers] = None
+        self._seat_carriers: dict[DraftReqKey, _SeatCarrier] = {}
         self._enable_glue_fast_path = bool(enable_glue_fast_path)
+        # Static scatter templates shared by every seat carrier: glue triangle
+        # (row g needs c_1..c_g's slots at [L:L+g] INCLUSIVE -- fa3 extend
+        # reads the current token's own K/V through the page table too) +
+        # branch case prefixes (row (c, f) needs c_1..c_c's slots at [L:L+c);
+        # its own entry is written by alloc_for_decode). Entry j's value is
+        # backbone slot j.
+        num_cases = self.num_steps + 1
+        tri_g = [g for g in range(self.num_steps) for j in range(g + 1)]
+        tri_j = [j for g in range(self.num_steps) for j in range(g + 1)]
+        br_r = [
+            c * self.fanout + f
+            for c in range(num_cases)
+            for f in range(self.fanout)
+            for j in range(c)
+        ]
+        br_j = [
+            j for c in range(num_cases) for f in range(self.fanout) for j in range(c)
+        ]
+        self._tri_g = torch.tensor(tri_g, dtype=torch.int64, device=self.device)
+        self._br_r = torch.tensor(br_r, dtype=torch.int64, device=self.device)
+        self._comb_j = torch.tensor(tri_j + br_j, dtype=torch.int64, device=self.device)
+        self._case_of_row = [c for c in range(num_cases) for _ in range(self.fanout)]
+        # Reusable batch shells for assembled fast subrounds (retained from
+        # slow rounds; per-round fields are fully rebound before each use).
+        self._glue_template: Optional[ScheduleBatch] = None
+        self._branch_template: Optional[ScheduleBatch] = None
         self.hit_ct = 0
         self.miss_ct = 0
         self.profiler = _RoundProfiler(
@@ -251,9 +256,7 @@ class EnumDraftEngine:
         state.committed_tokens.extend(int(t) for t in committed_tokens)
 
     def close(self, key: DraftReqKey) -> None:
-        # The carriers are keyed on the exact key set; any membership change
-        # invalidates them.
-        self._evict_carriers()
+        self._evict_seat(key)
         state = self._states.pop(key, None)
         if state is not None and state.committed_slots.numel() > 0:
             self.model_runner.token_to_kv_pool_allocator.free(state.committed_slots)
@@ -271,68 +274,100 @@ class EnumDraftEngine:
         arrays {pool_indices, base_committed_lens, tokens} or None if no key
         is live. Frees every scratch slot before returning.
 
-        Two forms of the same tree:
+        Two forms of the same tree, mixed PER SEAT within one call:
 
-        - **glue fast path** (every seat's commit matched a unit of its last
+        - **glue fast path** (this seat's commit matched a unit of its last
           block): the winning unit's chain IS the new backbone (greedy
           re-draft is deterministic), so one K-row extend re-materializes
           its KV and yields all node logits; the branch phase runs as plain
-          decode replays on the retained carrier batch.
-        - **slow path** (first round / any miss / key-set change): the
-          original build-everything round; it also (re)builds the carriers
-          and host mirrors that arm the fast path.
+          decode replays assembled from the seat's retained carrier rows.
+        - **slow path** (first round / miss / no carrier): the original
+          build-everything round for the missing seats only; it also
+          (re)builds their seat carriers and host mirrors.
         """
         keys = [key for key in keys if key in self._states]
         if not keys:
             return None
-        states = [self._states[key] for key in keys]
         scratch_batches: list[ScheduleBatch] = []
         scratch_slots: list[torch.Tensor] = []
         self.profiler.start_round()
         try:
-            selections = self._match_fast_path(keys, states)
-            if selections is not None:
+            hit_keys: list[DraftReqKey] = []
+            hit_states: list[_DraftReqState] = []
+            selections: list[tuple[int, int]] = []
+            miss_keys: list[DraftReqKey] = []
+            miss_states: list[_DraftReqState] = []
+            for key in keys:
+                state = self._states[key]
+                selection = self._match_seat(key, state)
+                if selection is not None:
+                    hit_keys.append(key)
+                    hit_states.append(state)
+                    selections.append(selection)
+                else:
+                    miss_keys.append(key)
+                    miss_states.append(state)
+            parts: list[dict] = []
+            if hit_states:
                 self.hit_ct += 1
-                return self._fast_round(
-                    states, selections, scratch_batches, scratch_slots
+                parts.append(
+                    self._fast_round(
+                        hit_keys,
+                        hit_states,
+                        selections,
+                        scratch_batches,
+                        scratch_slots,
+                    )
                 )
-            self.miss_ct += 1
-            return self._slow_round(keys, states, scratch_batches, scratch_slots)
+            if miss_states:
+                self.miss_ct += 1
+                parts.append(
+                    self._slow_round(
+                        miss_keys, miss_states, scratch_batches, scratch_slots
+                    )
+                )
+            if len(parts) == 1:
+                return parts[0]
+            return {
+                "pool_indices": parts[0]["pool_indices"] + parts[1]["pool_indices"],
+                "base_committed_lens": parts[0]["base_committed_lens"]
+                + parts[1]["base_committed_lens"],
+                "units_device": torch.cat(
+                    [parts[0]["units_device"], parts[1]["units_device"]]
+                ),
+            }
         finally:
             self._free_scratch(scratch_batches, scratch_slots)
             self.profiler.mark("free")
 
-    def _match_fast_path(
-        self, keys: list[DraftReqKey], states: list[_DraftReqState]
-    ) -> Optional[list[tuple[int, int]]]:
-        """Match every seat's pending delta against its last block; returns
-        the winning (accept_case, fanout_index) per seat, or None if any seat
-        misses (which routes the whole round to the slow path)."""
+    def _match_seat(
+        self, key: DraftReqKey, state: _DraftReqState
+    ) -> Optional[tuple[int, int]]:
+        """Match one seat's pending delta against its last block; returns the
+        winning (accept_case, fanout_index) or None (seat runs slow)."""
         if not self._enable_glue_fast_path:
             return None
-        if self._carriers is None or self._carriers.keys != tuple(keys):
+        if key not in self._seat_carriers:
             return None
-        selections: list[tuple[int, int]] = []
-        for state in states:
-            if state.last_units_host is None or state.last_backbone_host is None:
-                return None
-            delta = state.pending_delta()
-            case = len(delta) - 1
-            if case < 0 or case > self.num_steps:
-                return None
-            if delta[:case] != state.last_backbone_host[:case]:
-                return None
-            if state.mirror_event is not None:
-                state.mirror_event.synchronize()
-            guesses_row = state.last_units_host[case, :, 0].tolist()
-            bonus = delta[case]
-            if bonus not in guesses_row:
-                return None
-            selections.append((case, guesses_row.index(bonus)))
-        return selections
+        if state.last_units_host is None or state.last_backbone_host is None:
+            return None
+        delta = state.pending_delta()
+        case = len(delta) - 1
+        if case < 0 or case > self.num_steps:
+            return None
+        if delta[:case] != state.last_backbone_host[:case]:
+            return None
+        if state.mirror_event is not None:
+            state.mirror_event.synchronize()
+        guesses_row = state.last_units_host[case, :, 0].tolist()
+        bonus = delta[case]
+        if bonus not in guesses_row:
+            return None
+        return (case, guesses_row.index(bonus))
 
     def _fast_round(
         self,
+        keys: list[DraftReqKey],
         states: list[_DraftReqState],
         selections: list[tuple[int, int]],
         scratch_batches: list[ScheduleBatch],
@@ -340,7 +375,7 @@ class EnumDraftEngine:
     ) -> dict:
         num_steps, fanout = self.num_steps, self.fanout
         bs = len(states)
-        carriers = self._carriers
+        carriers = [self._seat_carriers[key] for key in keys]
         allocator = self.model_runner.token_to_kv_pool_allocator
         pool = self.model_runner.req_to_token_pool
 
@@ -369,17 +404,17 @@ class EnumDraftEngine:
         backbone_slots = backbone_slots.view(bs, num_steps)
         chains: list[torch.Tensor] = []
         new_backbones: list[list[int]] = []
-        for i, state in enumerate(states):
+        for i, (state, carrier) in enumerate(zip(states, carriers)):
             new_len = state.committed_slots.numel()
-            synced = min(carriers.synced_lens[i], base_lens[i])
-            pool.req_to_token[carriers.all_rows[i], synced:new_len] = (
-                state.committed_slots[synced:new_len].to(torch.int32)
-            )
-            carriers.synced_lens[i] = new_len
+            synced = min(carrier.synced_len, base_lens[i])
+            pool.req_to_token[carrier.all_rows, synced:new_len] = state.committed_slots[
+                synced:new_len
+            ].to(torch.int32)
+            carrier.synced_len = new_len
             slots_i32 = backbone_slots[i].to(torch.int32)
-            pool.req_to_token[carriers.comb_rows[i], carriers.comb_j + new_len] = (
-                slots_i32[carriers.comb_j]
-            )
+            pool.req_to_token[carrier.comb_rows, self._comb_j + new_len] = slots_i32[
+                self._comb_j
+            ]
             case, f = selections[i]
             chains.append(state.last_units_dev[case, f, 1:])
             # The old host mirror was synced during matching; snapshot the new
@@ -390,16 +425,22 @@ class EnumDraftEngine:
         # -- Glue extend: all K backbone tokens in one forward = node 1..K
         # logits; their KV lands in this round's backbone slots.
         glue_logits = self._glue_forward(
-            states=states, chains=chains, backbone_slots=backbone_slots
+            carriers=carriers,
+            states=states,
+            chains=chains,
+            backbone_slots=backbone_slots,
         )
         glue_guesses = torch.topk(
             glue_logits.view(bs, num_steps, -1), fanout, dim=-1
         ).indices  # [bs, K, F]
         guesses_stack = torch.cat([node0_guesses.unsqueeze(1), glue_guesses], dim=1)
 
-        # -- Branch chains: K decode replays on the retained carrier batch.
+        # -- Branch chains: K decode replays on the assembled carrier rows.
         chain_steps = self._branch_decode_chain(
-            states=states, guesses_stack=guesses_stack, scratch_slots=scratch_slots
+            carriers=carriers,
+            states=states,
+            guesses_stack=guesses_stack,
+            scratch_slots=scratch_slots,
         )
         return self._pack_and_mirror(
             states=states,
@@ -411,13 +452,24 @@ class EnumDraftEngine:
     def _glue_forward(
         self,
         *,
+        carriers: list[_SeatCarrier],
         states: list[_DraftReqState],
         chains: list[torch.Tensor],
         backbone_slots: torch.Tensor,
     ) -> torch.Tensor:
         num_steps = self.num_steps
         bs = len(states)
-        glue = self._carriers.glue_batch
+        glue = self._glue_template
+        # Assemble the subset's rows onto the shared shell (rebind-only).
+        glue.reqs = [req for carrier in carriers for req in carrier.glue_reqs]
+        glue.req_pool_indices = (
+            torch.cat([carrier.glue_rows for carrier in carriers])
+            if bs > 1
+            else carriers[0].glue_rows
+        )
+        glue.extend_lens = [1] * (bs * num_steps)
+        glue.extend_logprob_start_lens = [0] * (bs * num_steps)
+        glue.extend_num_tokens = bs * num_steps
         lens = [state.committed_slots.numel() for state in states]
         seq_host = [lens[i] + g + 1 for i in range(bs) for g in range(num_steps)]
         seq_cpu = torch.tensor(seq_host, dtype=torch.int64)
@@ -434,17 +486,23 @@ class EnumDraftEngine:
     def _branch_decode_chain(
         self,
         *,
+        carriers: list[_SeatCarrier],
         states: list[_DraftReqState],
         guesses_stack: torch.Tensor,
         scratch_slots: list[torch.Tensor],
     ) -> list[torch.Tensor]:
         num_steps = self.num_steps
-        branch = self._carriers.branch_batch
-        case_of_row = self._carriers.case_of_row
+        branch = self._branch_template
+        branch.reqs = [req for carrier in carriers for req in carrier.branch_reqs]
+        branch.req_pool_indices = (
+            torch.cat([carrier.branch_rows for carrier in carriers])
+            if len(carriers) > 1
+            else carriers[0].branch_rows
+        )
         seq_host = [
             state.committed_slots.numel() + case
             for state in states
-            for case in case_of_row
+            for case in self._case_of_row
         ]
         seq_cpu = torch.tensor(seq_host, dtype=torch.int64)
         branch.seq_lens = seq_cpu.to(self.device, non_blocking=True)
@@ -488,9 +546,10 @@ class EnumDraftEngine:
         num_steps, fanout = self.num_steps, self.fanout
         num_cases = num_steps + 1
         bs = len(states)
-        # A slow round never uses the carriers and rebuilds them at the end;
-        # evicting up front halves the round's peak pool-row usage.
-        self._evict_carriers()
+        # A slow subround rebuilds its seats' carriers at the end; evicting
+        # them up front bounds the subround's peak pool-row usage.
+        for key in keys:
+            self._evict_seat(key)
 
         # -- Phase 1: advance the committed prefix; last logits = node 0 ----
         node_logits: list[torch.Tensor] = []
@@ -583,7 +642,7 @@ class EnumDraftEngine:
             chain_steps=chain_steps,
             new_backbones=backbone_cpu,
         )
-        self._rebuild_carriers(
+        self._build_seat_carriers(
             keys=keys,
             states=states,
             branch_batch=branch_batch,
@@ -639,7 +698,7 @@ class EnumDraftEngine:
             "units_device": units_device,
         }
 
-    def _rebuild_carriers(
+    def _build_seat_carriers(
         self,
         *,
         keys: list[DraftReqKey],
@@ -650,12 +709,12 @@ class EnumDraftEngine:
         backbone_cpu: list[list[int]],
         backbone_slots_dev: torch.Tensor,
     ) -> None:
-        """Retain this slow round's branch batch + a freshly built glue batch
-        as the fast path's carriers (their pool rows persist; KV slots stay
-        per-round scratch)."""
+        """Donate this slow subround's branch rows + a freshly built glue
+        batch to per-seat carriers (pool rows persist until the seat closes;
+        KV slots stay per-round scratch). The built batches double as the
+        assembly shells for later fast subrounds."""
         if not self._enable_glue_fast_path:
             return
-        self._evict_carriers()
         # The branch batch's pool rows survive the round; its KV slots are
         # already tracked in scratch_slots and freed as usual.
         scratch_batches.remove(branch_batch)
@@ -675,25 +734,34 @@ class EnumDraftEngine:
         # Build-time extend slots are placeholders (no forward ran); the fast
         # path re-points out_cache_loc at each round's backbone slots.
         scratch_slots.append(glue_slots)
-        self._carriers = _RoundCarriers(
-            keys=tuple(keys),
-            glue_batch=glue_batch,
-            branch_batch=branch_batch,
-            synced_lens=[state.committed_slots.numel() for state in states],
-            num_steps=self.num_steps,
-            fanout=self.fanout,
-            device=self.device,
-        )
+        bs = len(keys)
+        num_steps = self.num_steps
+        rows_per_seat = (num_steps + 1) * self.fanout
+        glue_rows_all = glue_batch.req_pool_indices.view(bs, num_steps)
+        branch_rows_all = branch_batch.req_pool_indices.view(bs, rows_per_seat)
+        for i, (key, state) in enumerate(zip(keys, states)):
+            self._seat_carriers[key] = _SeatCarrier(
+                glue_rows=glue_rows_all[i],
+                branch_rows=branch_rows_all[i],
+                glue_reqs=glue_batch.reqs[i * num_steps : (i + 1) * num_steps],
+                branch_reqs=branch_batch.reqs[
+                    i * rows_per_seat : (i + 1) * rows_per_seat
+                ],
+                synced_len=state.committed_slots.numel(),
+                tri_g=self._tri_g,
+                br_r=self._br_r,
+            )
+        self._glue_template = glue_batch
+        self._branch_template = branch_batch
         self.profiler.mark("carrier_build")
 
-    def _evict_carriers(self) -> None:
-        carriers, self._carriers = self._carriers, None
-        if carriers is None:
+    def _evict_seat(self, key: DraftReqKey) -> None:
+        carrier = self._seat_carriers.pop(key, None)
+        if carrier is None:
             return
-        for batch in (carriers.glue_batch, carriers.branch_batch):
-            for req in batch.reqs:
-                if req.req_pool_idx is not None:
-                    self.model_runner.req_to_token_pool.free(req)
+        for req in carrier.glue_reqs + carrier.branch_reqs:
+            if req.req_pool_idx is not None:
+                self.model_runner.req_to_token_pool.free(req)
 
     # ------------------------------------------------------------------ #
     # Batch plumbing (bench_one_batch harness pattern)
