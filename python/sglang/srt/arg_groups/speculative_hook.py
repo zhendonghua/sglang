@@ -161,7 +161,7 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
     # harness's 1-token decode steps. The speculative_* numeric fields survive
     # (they size the enumeration output); the algorithm is cleared once the
     # role validator and the per-algorithm handler consumed it.
-    if server_args.is_decoupled_drafter():
+    if server_args.decoupled_spec_role == "drafter":
         server_args.speculative_algorithm = None
 
 
