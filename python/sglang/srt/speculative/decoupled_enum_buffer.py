@@ -68,14 +68,18 @@ class DecoupledEnumBuffer:
         # req_to_token.shape[0] == max_running + 1, so seat 0 stays the harmless
         # cuda-graph padding row; never size to bare max_running.
         self.seats = int(req_to_token_pool.req_to_token.shape[0])
-        # Each seat holds the TWO newest stamped blocks (generations). The block
-        # serving round r was enumerated two commits back (stamp |P_{r-2}|),
-        # while the commit of round r-1 has already pushed the next block
-        # (stamp |P_{r-1}|): with one generation the newer push would clobber
-        # the block round r selects from, turning every round into a staleness
-        # fallback under sync pacing. gather() returns both; the select matches
-        # stamps against the expected base and picks the right generation.
-        self.gen_count = 2
+        # Each seat holds the TWO newest stamped real blocks (generations 0/1).
+        # The block serving round r was enumerated two commits back (stamp
+        # |P_{r-2}|), while the commit of round r-1 has already pushed the next
+        # block (stamp |P_{r-1}|): with one generation the newer push would
+        # clobber the block round r selects from, turning every round into a
+        # staleness fallback under sync pacing. Generation 2 is the dedicated
+        # slot for top-1 prerun blocks (enumerated from a PREDICTED commit and
+        # shipped early); its stamp matches only when the bet was right, so
+        # the select needs no lookup-order logic -- it scans all generations
+        # and stamp equality picks the winner.
+        self.gen_count = 3
+        self._prerun_gen = 2
         # Double-buffer (mamba idiom, memory_pool.py:849) is the phase 6.3 form;
         # buf_count is always 1 here (enable_overlap is rejected above).
         self.buf_count = 2 if enable_overlap else 1
@@ -176,7 +180,9 @@ class DecoupledEnumBuffer:
             block.base_committed_lens, dtype=torch.int64, device=self.device
         )
 
-        self._scatter_generation(pool_indices, rows, base_committed_lens)
+        self._scatter_generation(
+            pool_indices, rows, base_committed_lens, speculative=block.speculative
+        )
 
     def land_rows_device(
         self,
@@ -191,10 +197,13 @@ class DecoupledEnumBuffer:
         """
         if pool_indices.numel() == 0:
             return
+        # The CUDA IPC row header carries no speculative flag yet; preruns are
+        # ZMQ-only for now (flag word in the row header when needed).
         self._scatter_generation(
             pool_indices.to(torch.int64),
             rows.to(torch.int64),
             base_committed_lens.to(torch.int64),
+            speculative=False,
         )
 
     def _scatter_generation(
@@ -202,9 +211,19 @@ class DecoupledEnumBuffer:
         pool_indices: torch.Tensor,
         rows: torch.Tensor,
         base_committed_lens: torch.Tensor,
+        *,
+        speculative: bool,
     ) -> None:
         slot = self._write_slot
-        # Write the generation NOT written last, then mark it newest: the
+        if speculative:
+            # Prerun blocks own generation 2 and never advance the real-block
+            # rotation: a wrong bet must not shorten a real block's lifetime.
+            self.enum_tokens[slot][pool_indices, self._prerun_gen] = rows
+            self.enum_base_committed_lens[slot][
+                pool_indices, self._prerun_gen
+            ] = base_committed_lens
+            return
+        # Write the real generation NOT written last, then mark it newest: the
         # previous block survives exactly one more push (see gen_count above).
         write_gens = 1 - self.enum_last_gen[slot][pool_indices]
         self.enum_tokens[slot][pool_indices, write_gens] = rows

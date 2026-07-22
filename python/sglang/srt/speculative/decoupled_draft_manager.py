@@ -18,6 +18,7 @@ import logging
 import time
 from typing import TYPE_CHECKING
 
+from sglang.srt.environ import envs
 from sglang.srt.speculative.decoupled_draft_engine import EnumDraftEngine
 from sglang.srt.speculative.decoupled_spec_io import (
     DecoupledSpecIpcConfig,
@@ -77,6 +78,11 @@ class DecoupledDraftManager:
         self._round_ct = 0
         self._round_time_s = 0.0
         self._push_time_s = 0.0
+        # Top-1 prerun rides the ZMQ block message's speculative flag; the
+        # CUDA IPC row header has no flag word yet.
+        self._enable_top1_prerun = (
+            envs.SGLANG_ENABLE_DECOUPLED_TOP1_PRERUN.get() and data_transport == "zmq"
+        )
 
         self.ipc_block_pool = None
         if data_transport == "cuda_ipc":
@@ -125,6 +131,7 @@ class DecoupledDraftManager:
         for draft_key in ready.close_keys:
             self.engine.close(draft_key)
         touched: dict[DraftReqKey, None] = {}
+        confirmed: dict[DraftReqKey, None] = {}
         for sync in ready.sync_messages:
             self.engine.open(
                 sync.draft_key,
@@ -136,9 +143,15 @@ class DecoupledDraftManager:
         for segment in ready.ready_commit_segments:
             if not self.engine.has(segment.draft_key):
                 continue
-            self.engine.apply_commit(segment.draft_key, list(segment.committed_tokens))
-            touched[segment.draft_key] = None
-        if not touched:
+            if self.engine.apply_commit(
+                segment.draft_key, list(segment.committed_tokens)
+            ):
+                # A confirmed top-1 prerun: this seat's next block is already
+                # on the verifier; nothing to draft for this commit.
+                confirmed[segment.draft_key] = None
+            else:
+                touched[segment.draft_key] = None
+        if not touched and not confirmed:
             return
         # One block per owning verifier (1:1 today: a single peer).
         by_verifier: dict[int, list[DraftReqKey]] = {}
@@ -152,45 +165,65 @@ class DecoupledDraftManager:
             if self._round_ct % 200 == 0:
                 logger.info(
                     "decoupled drafter rounds: ct=%d avg_ms=%.1f push_ms=%.2f "
-                    "last_bs=%d fast=%d slow=%d",
+                    "last_bs=%d fast=%d slow=%d prerun_hit=%d prerun_miss=%d",
                     self._round_ct,
                     1000.0 * self._round_time_s / self._round_ct,
                     1000.0 * self._push_time_s / self._round_ct,
                     len(draft_keys),
                     self.engine.hit_ct,
                     self.engine.miss_ct,
+                    self.engine.prerun_hit_ct,
+                    self.engine.prerun_miss_ct,
                 )
                 if self.engine.profiler.enabled:
                     logger.info(
                         "decoupled drafter round breakdown: %s",
                         self.engine.profiler.summary(),
                     )
-            if packed is None:
-                continue
-            push_start = time.monotonic()
-            if self.ipc_block_pool is not None:
-                # CUDA IPC data plane: D2D into the shared pool; the shm flag
-                # bump after the device sync is the arrival signal.
-                self.ipc_block_pool.push(
-                    pool_indices=packed["pool_indices"],
-                    base_committed_lens=packed["base_committed_lens"],
-                    units=packed["units_device"],
+            self._push_block(verifier_rank=verifier_rank, packed=packed)
+        if self._enable_top1_prerun:
+            by_verifier_prerun: dict[int, list[DraftReqKey]] = {}
+            for draft_key in list(touched) + list(confirmed):
+                by_verifier_prerun.setdefault(draft_key.src_verifier_rank, []).append(
+                    draft_key
                 )
-                self._push_time_s += time.monotonic() - push_start
-                continue
-            self.ipc_thread.submit_draft_results(
-                DraftEnumerationBufferBatch(
-                    src_drafter_rank=self.ipc_config.rank,
-                    dst_verifier_rank=verifier_rank,
-                    num_steps=self.num_steps,
-                    fanout=self.fanout,
-                    pool_indices=packed["pool_indices"],
-                    base_committed_lens=packed["base_committed_lens"],
-                    tokens=tuple(packed["units_device"].to("cpu").reshape(-1).tolist()),
-                    sent_unix_ts=time.time(),
+            for verifier_rank, draft_keys in by_verifier_prerun.items():
+                packed = self.engine.speculative_prerun(draft_keys)
+                self._push_block(
+                    verifier_rank=verifier_rank, packed=packed, speculative=True
                 )
+
+    def _push_block(
+        self, *, verifier_rank: int, packed, speculative: bool = False
+    ) -> None:
+        if packed is None:
+            return
+        push_start = time.monotonic()
+        if self.ipc_block_pool is not None:
+            # CUDA IPC data plane: D2D into the shared pool; the shm flag
+            # bump after the device sync is the arrival signal. (Preruns are
+            # ZMQ-only and gated off for this plane.)
+            self.ipc_block_pool.push(
+                pool_indices=packed["pool_indices"],
+                base_committed_lens=packed["base_committed_lens"],
+                units=packed["units_device"],
             )
             self._push_time_s += time.monotonic() - push_start
+            return
+        self.ipc_thread.submit_draft_results(
+            DraftEnumerationBufferBatch(
+                src_drafter_rank=self.ipc_config.rank,
+                dst_verifier_rank=verifier_rank,
+                num_steps=self.num_steps,
+                fanout=self.fanout,
+                pool_indices=packed["pool_indices"],
+                base_committed_lens=packed["base_committed_lens"],
+                tokens=tuple(packed["units_device"].to("cpu").reshape(-1).tolist()),
+                sent_unix_ts=time.time(),
+                speculative=speculative,
+            )
+        )
+        self._push_time_s += time.monotonic() - push_start
 
     def close(self) -> None:
         self.ipc_thread.close()

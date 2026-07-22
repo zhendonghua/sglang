@@ -124,6 +124,10 @@ class _DraftReqState:
         self.last_units_host: Optional[torch.Tensor] = None  # pinned mirror
         self.last_backbone_host: Optional[list[int]] = None  # c_1..c_K
         self.mirror_event: Optional[torch.cuda.Event] = None
+        # Top-1 prerun bet: number of speculatively committed tokens (0 = no
+        # active bet) + the pre-bet mirror snapshot for rollback.
+        self.prerun_len = 0
+        self.prerun_snapshot: Optional[tuple] = None
 
     def pending_delta(self) -> list[int]:
         """Committed tokens whose KV has not been advanced yet."""
@@ -199,6 +203,8 @@ class EnumDraftEngine:
         self._states: dict[DraftReqKey, _DraftReqState] = {}
         self._seat_carriers: dict[DraftReqKey, _SeatCarrier] = {}
         self._enable_glue_fast_path = bool(enable_glue_fast_path)
+        self.prerun_hit_ct = 0
+        self.prerun_miss_ct = 0
         # Static scatter templates shared by every seat carrier: glue triangle
         # (row g needs c_1..c_g's slots at [L:L+g] INCLUSIVE -- fa3 extend
         # reads the current token's own K/V through the page table too) +
@@ -249,11 +255,89 @@ class EnumDraftEngine:
         state.committed_tokens = list(prompt_tokens) + list(committed_outputs)
         self._states[key] = state
 
-    def apply_commit(self, key: DraftReqKey, committed_tokens: list[int]) -> None:
+    def apply_commit(self, key: DraftReqKey, committed_tokens: list[int]) -> bool:
+        """Apply a real commit; returns True when an active top-1 prerun bet
+        matched it exactly (the seat's next block is already on the verifier,
+        so the caller skips drafting it this round)."""
         state = self._states.get(key)
         if state is None:
-            return
-        state.committed_tokens.extend(int(t) for t in committed_tokens)
+            return False
+        delta = [int(t) for t in committed_tokens]
+        if state.prerun_len > 0:
+            bet = state.committed_tokens[-state.prerun_len :]
+            if delta == bet:
+                state.prerun_len = 0
+                state.prerun_snapshot = None
+                self.prerun_hit_ct += 1
+                return True
+            self._rollback_prerun(state)
+            self.prerun_miss_ct += 1
+        state.committed_tokens.extend(delta)
+        return False
+
+    def _rollback_prerun(self, state: _DraftReqState) -> None:
+        """Undo a wrong bet: drop the speculative tokens, free their KV, and
+        restore the pre-bet mirrors (the real delta must be matched against
+        the pre-bet block, not the bet one)."""
+        base_len = len(state.committed_tokens) - state.prerun_len
+        if state.committed_slots.numel() > base_len:
+            self.model_runner.token_to_kv_pool_allocator.free(
+                state.committed_slots[base_len:]
+            )
+            state.committed_slots = state.committed_slots[:base_len]
+        state.committed_tokens = state.committed_tokens[:base_len]
+        units_dev, units_host_clone, backbone_host, mirror_event = state.prerun_snapshot
+        state.last_units_dev = units_dev
+        if state.last_units_host is not None and units_host_clone is not None:
+            # Restore INTO the pinned buffer so the mirror keeps its identity.
+            state.last_units_host.copy_(units_host_clone)
+        state.last_backbone_host = backbone_host
+        state.mirror_event = mirror_event
+        state.prerun_len = 0
+        state.prerun_snapshot = None
+
+    @torch.no_grad()
+    def speculative_prerun(self, keys: list[DraftReqKey]) -> Optional[dict]:
+        """Bet each seat's most likely next commit (full accept + its own top
+        bonus guess g_{K,0}), pre-run that round now, and return the packed
+        block to ship speculatively. By construction the bet delta hits the
+        glue fast path. A wrong bet is rolled back by apply_commit and only
+        cost idle drafter time."""
+        ready: list[tuple[DraftReqKey, _DraftReqState]] = []
+        for key in keys:
+            state = self._states.get(key)
+            if (
+                state is None
+                or state.prerun_len > 0
+                or state.last_units_host is None
+                or state.last_backbone_host is None
+                or key not in self._seat_carriers
+            ):
+                continue
+            ready.append((key, state))
+        if not ready:
+            return None
+        for _, state in ready:
+            if state.mirror_event is not None:
+                state.mirror_event.synchronize()
+            bet_delta = list(state.last_backbone_host) + [
+                int(state.last_units_host[self.num_steps, 0, 0])
+            ]
+            state.prerun_snapshot = (
+                state.last_units_dev,
+                state.last_units_host.clone(),
+                state.last_backbone_host,
+                state.mirror_event,
+            )
+            state.committed_tokens.extend(bet_delta)
+            state.prerun_len = len(bet_delta)
+        try:
+            return self.draft_round([key for key, _ in ready])
+        except Exception:
+            for _, state in ready:
+                if state.prerun_len > 0:
+                    self._rollback_prerun(state)
+            raise
 
     def close(self, key: DraftReqKey) -> None:
         self._evict_seat(key)

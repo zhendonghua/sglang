@@ -354,6 +354,13 @@ class Envs:
     # control-plane send, arrival wait, block transport latency). Pure host
     # timestamps -- cheap, but debug instrumentation only.
     SGLANG_DEBUG_DECOUPLED_VERIFY_PROFILE = EnvBool(False)
+    # Decoupled spec: after each round the drafter bets the most likely next
+    # commit (full accept + its own top bonus guess), pre-runs that round and
+    # ships the block early into the speculative buffer generation. A right
+    # bet removes the drafter round-trip from the verifier's critical path; a
+    # wrong bet is rolled back and costs only idle drafter time. ZMQ data
+    # plane only.
+    SGLANG_ENABLE_DECOUPLED_TOP1_PRERUN = EnvBool(False)
 
     # Scheduler: memory leak test
     SGLANG_TEST_RETRACT = EnvBool(False)

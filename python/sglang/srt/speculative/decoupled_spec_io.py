@@ -174,6 +174,11 @@ class DraftEnumerationBufferBatch:
     # Drafter-side time.time() at submit; debug-profile latency only (both
     # processes share the host clock). None when profiling is off.
     sent_unix_ts: Optional[float] = None
+    # True for a top-1 prerun block: enumerated from a PREDICTED commit (the
+    # drafter bet on full-accept + its own top bonus guess) and shipped before
+    # the real commit. Lands in the dedicated speculative generation; its
+    # stamp only ever matches when the bet was right.
+    speculative: bool = False
 
     @property
     def row_stride(self) -> int:
