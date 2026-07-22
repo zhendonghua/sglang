@@ -361,6 +361,11 @@ class Envs:
     # wrong bet is rolled back and costs only idle drafter time. ZMQ data
     # plane only.
     SGLANG_ENABLE_DECOUPLED_TOP1_PRERUN = EnvBool(False)
+    # Decoupled spec: minimum shared-prefix length (tokens) before the
+    # drafter's branch decode switches to two-level cascade attention (read
+    # the shared prefix once per seat instead of once per row). Below ~4k the
+    # prefix lives in L2 and cascade only adds overhead. 0 disables.
+    SGLANG_DECOUPLED_CASCADE_MIN_PREFIX_LEN = EnvInt(0)
 
     # Scheduler: memory leak test
     SGLANG_TEST_RETRACT = EnvBool(False)

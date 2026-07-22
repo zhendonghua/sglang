@@ -503,6 +503,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
             return False
+        # Decoupled-spec cascade decode runs its two-level attention eagerly
+        # (the captured graphs hold the single-call attention).
+        if forward_batch.decoupled_cascade is not None:
+            return False
 
         ragged_layout = (
             resolve_ragged_verify_layout(forward_batch)

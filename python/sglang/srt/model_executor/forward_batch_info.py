@@ -447,6 +447,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Speculative decoding
     spec_info: Optional[SpecInput] = None
 
+    # Decoupled enumeration spec: shared-prefix cascade metadata for the
+    # drafter's branch-decode batches (duck-typed container set by the enum
+    # draft engine AFTER init_new; consumed by the fa3 decode path; None
+    # everywhere else).
+    decoupled_cascade: Optional[object] = None
+
     # === Derived from ScheduleBatch.reqs ===
     # For LoRA
     lora_ids: Optional[List[str]] = None

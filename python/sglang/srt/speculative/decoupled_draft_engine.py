@@ -30,6 +30,7 @@ from array import array
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Optional
 
+import msgspec
 import torch
 
 from sglang.srt.environ import envs
@@ -134,6 +135,17 @@ class _DraftReqState:
         return self.committed_tokens[self.committed_slots.numel() :]
 
 
+class _CascadeMetadata(msgspec.Struct):
+    """Shared-prefix cascade inputs for one branch-decode chain (fa3 decode
+    consumes it via ForwardBatch.decoupled_cascade). Page tables/lens are
+    int32 per the fa3 convention; tail state advances in place per step."""
+
+    prefix_page_table: torch.Tensor  # [seats, max_prefix_len]
+    prefix_lens: torch.Tensor  # [seats]
+    tail_page_table: torch.Tensor  # [rows, 2K+2]
+    tail_lens: torch.Tensor  # [rows]
+
+
 class _SeatCarrier:
     """Retained fast-path pool rows + scatter template for ONE seat.
 
@@ -205,6 +217,11 @@ class EnumDraftEngine:
         self._enable_glue_fast_path = bool(enable_glue_fast_path)
         self.prerun_hit_ct = 0
         self.prerun_miss_ct = 0
+        # Shared-prefix cascade for branch decodes (fa3): only past this
+        # prefix length does dedup beat the L2-served re-reads. 0 = off.
+        self._cascade_min_prefix_len = (
+            envs.SGLANG_DECOUPLED_CASCADE_MIN_PREFIX_LEN.get()
+        )
         # Static scatter templates shared by every seat carrier: glue triangle
         # (row g needs c_1..c_g's slots at [L:L+g] INCLUSIVE -- fa3 extend
         # reads the current token's own K/V through the page table too) +
@@ -225,6 +242,7 @@ class EnumDraftEngine:
         ]
         self._tri_g = torch.tensor(tri_g, dtype=torch.int64, device=self.device)
         self._br_r = torch.tensor(br_r, dtype=torch.int64, device=self.device)
+        self._br_j = torch.tensor(br_j, dtype=torch.int64, device=self.device)
         self._comb_j = torch.tensor(tri_j + br_j, dtype=torch.int64, device=self.device)
         self._case_of_row = [c for c in range(num_cases) for _ in range(self.fanout)]
         # Reusable batch shells for assembled fast subrounds (retained from
@@ -533,6 +551,7 @@ class EnumDraftEngine:
             carriers=carriers,
             states=states,
             guesses_stack=guesses_stack,
+            backbone_slots=backbone_slots,
             scratch_slots=scratch_slots,
         )
         return self._pack_and_mirror(
@@ -582,6 +601,7 @@ class EnumDraftEngine:
         carriers: list[_SeatCarrier],
         states: list[_DraftReqState],
         guesses_stack: torch.Tensor,
+        backbone_slots: torch.Tensor,
         scratch_slots: list[torch.Tensor],
     ) -> list[torch.Tensor]:
         num_steps = self.num_steps
@@ -602,19 +622,64 @@ class EnumDraftEngine:
         branch.seq_lens_cpu = seq_cpu
         branch.seq_lens_sum = None
         branch.orig_seq_lens = branch.seq_lens.to(torch.int32)
+        cascade = self._build_branch_cascade(
+            states=states, backbone_slots=backbone_slots
+        )
         self.profiler.mark("branch_mut")
         logits, step_slots = self._decode_step(
-            branch, guesses_stack.reshape(-1), tag="branch"
+            branch, guesses_stack.reshape(-1), tag="branch", cascade=cascade
         )
         scratch_slots.append(step_slots)
         chain_steps: list[torch.Tensor] = [logits.argmax(dim=-1)]
         for _ in range(num_steps - 1):
             logits, step_slots = self._decode_step(
-                branch, chain_steps[-1], tag="branch"
+                branch, chain_steps[-1], tag="branch", cascade=cascade
             )
             scratch_slots.append(step_slots)
             chain_steps.append(logits.argmax(dim=-1))
         return chain_steps
+
+    def _build_branch_cascade(
+        self,
+        *,
+        states: list[_DraftReqState],
+        backbone_slots: torch.Tensor,
+    ) -> Optional[_CascadeMetadata]:
+        """Shared-prefix cascade inputs for this round's branch chain, or None
+        below the L2 threshold (where per-row re-reads are effectively free
+        and the two-call split only adds overhead)."""
+        min_prefix = self._cascade_min_prefix_len
+        lens = [state.committed_slots.numel() for state in states]
+        if min_prefix <= 0 or min(lens) < min_prefix:
+            return None
+        seats = len(states)
+        rows_per_seat = (self.num_steps + 1) * self.fanout
+        prefix_page_table = torch.zeros(
+            (seats, max(lens)), dtype=torch.int32, device=self.device
+        )
+        for i, state in enumerate(states):
+            prefix_page_table[i, : lens[i]] = state.committed_slots.to(torch.int32)
+        tail_page_table = torch.zeros(
+            (seats * rows_per_seat, 2 * self.num_steps + 2),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        for i in range(seats):
+            block = tail_page_table[i * rows_per_seat : (i + 1) * rows_per_seat]
+            block[self._br_r, self._br_j] = backbone_slots[i].to(torch.int32)[
+                self._br_j
+            ]
+        tail_lens = torch.tensor(
+            [case for _ in states for case in self._case_of_row],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        return _CascadeMetadata(
+            prefix_page_table=prefix_page_table,
+            prefix_lens=torch.tensor(lens, dtype=torch.int32, device=self.device),
+            tail_page_table=tail_page_table,
+            tail_lens=tail_lens,
+        )
 
     def _absorb_advance_slots(
         self, states: list[_DraftReqState], advance_slots: torch.Tensor
@@ -912,14 +977,28 @@ class EnumDraftEngine:
         return logits_output.next_token_logits
 
     def _decode_step(
-        self, batch: ScheduleBatch, input_tokens: torch.Tensor, *, tag: str
+        self,
+        batch: ScheduleBatch,
+        input_tokens: torch.Tensor,
+        *,
+        tag: str,
+        cascade: Optional[_CascadeMetadata] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch.input_ids = input_tokens.to(torch.int64)
         batch.prepare_for_decode()
+        if cascade is not None:
+            # Append this step's KV slot to each row's private tail, then
+            # advance the tail lengths so the kernel covers the new token.
+            rows = cascade.tail_lens.shape[0]
+            cascade.tail_page_table[
+                torch.arange(rows, device=self.device), cascade.tail_lens.long()
+            ] = batch.out_cache_loc.to(torch.int32)
+            cascade.tail_lens.add_(1)
         self.profiler.mark(f"{tag}_step_prep")
         forward_batch = ForwardBatch.init_new(
             batch, self.model_runner, return_hidden_states_before_norm=False
         )
+        forward_batch.decoupled_cascade = cascade
         self.profiler.mark(f"{tag}_step_fb")
         logits_output = self.model_runner.forward(forward_batch).logits_output
         self.profiler.mark(f"{tag}_step_fwd")

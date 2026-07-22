@@ -1672,6 +1672,59 @@ class FlashAttentionBackend(AttentionBackend):
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
+    def _decoupled_cascade_decode(
+        self,
+        *,
+        q: torch.Tensor,
+        layer: RadixAttention,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        cascade,
+    ) -> torch.Tensor:
+        """Two-level decode for decoupled branch batches whose rows share a
+        per-seat committed prefix: one non-causal pass of all the seat's
+        queries over the SHARED prefix (read once) + one per-row pass over
+        the private tail, LSE-merged. Pays only when the prefix working set
+        exceeds L2 (~4k tokens); the enum draft engine gates on that.
+        """
+        heads, head_dim = layer.tp_q_head_num, layer.head_dim
+        rows = cascade.tail_lens.shape[0]
+        seats = cascade.prefix_lens.shape[0]
+        q_rows = q.contiguous().view(rows, 1, heads, head_dim)
+        o_prefix, lse_prefix, *_ = flash_attn_with_kvcache(
+            q=q_rows.view(seats, rows // seats, heads, head_dim),
+            k_cache=key_cache,
+            v_cache=value_cache,
+            page_table=cascade.prefix_page_table,
+            cache_seqlens=cascade.prefix_lens,
+            softmax_scale=layer.scaling,
+            causal=False,
+            softcap=layer.logit_cap,
+            return_softmax_lse=True,
+            num_splits=self.num_splits,
+            ver=self.fa_impl_ver,
+        )
+        o_tail, lse_tail, *_ = flash_attn_with_kvcache(
+            q=q_rows,
+            k_cache=key_cache,
+            v_cache=value_cache,
+            page_table=cascade.tail_page_table,
+            cache_seqlens=cascade.tail_lens,
+            softmax_scale=layer.scaling,
+            causal=True,
+            softcap=layer.logit_cap,
+            return_softmax_lse=True,
+            num_splits=self.num_splits,
+            ver=self.fa_impl_ver,
+        )
+        o, _ = merge_state_v2(
+            o_prefix.view(rows, heads, head_dim),
+            _lse_to_rows(lse_prefix, rows, heads),
+            o_tail.view(rows, heads, head_dim),
+            _lse_to_rows(lse_tail, rows, heads),
+        )
+        return o
+
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -1810,6 +1863,16 @@ class FlashAttentionBackend(AttentionBackend):
             value_cache = value_cache.view(
                 -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
             )
+
+            if forward_batch.decoupled_cascade is not None and not is_swa_layer:
+                o = self._decoupled_cascade_decode(
+                    q=q,
+                    layer=layer,
+                    key_cache=key_cache,
+                    value_cache=value_cache,
+                    cascade=forward_batch.decoupled_cascade,
+                )
+                return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
             if layer.is_cross_attention:
                 # Always use non-chunked logic for cross-attention
@@ -3534,5 +3597,14 @@ def cdiv(a: int, b: int) -> int:
 
 # TODO(hebiao064): remove this once we have a better way to handle the merge_state_v2 torch.compile issue
 @torch._dynamo.disable()
+def _lse_to_rows(lse: torch.Tensor, rows: int, heads: int) -> torch.Tensor:
+    """Normalize a flash-attn LSE of rows x heads (any layout) to [rows, heads]
+    for merge_state_v2 (which pairs it with o of [rows, heads, head_dim])."""
+    squeezed = lse.squeeze()
+    if squeezed.shape == (rows, heads):
+        return squeezed.contiguous()
+    return squeezed.reshape(heads, rows).T.contiguous()
+
+
 def merge_state_v2_wrapper(o, s_a, o_exp, s_b):
     return merge_state_v2(o, s_a, o_exp, s_b)
