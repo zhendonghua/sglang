@@ -365,7 +365,16 @@ class DecoupledVerifyManager:
                     committed_outputs=list(req.output_ids),
                 )
             )
+            # A fresh sync re-roots the drafter: the very next round's select
+            # reads the sync-triggered block, so gate on the synced total.
+            expected[state.pool_idx] = state.total_committed_len
         else:
+            # Gate the NEXT round on the block its select actually reads: the
+            # one enumerated from the PRE-delta state (this round's commit
+            # triggers the block that serves the round AFTER next). Waiting on
+            # the post-delta stamp -- the old behavior -- blocked a full
+            # drafter round-trip every step and serialized draft with verify.
+            expected[state.pool_idx] = state.total_committed_len
             committed_len = len(req.output_ids)
             if committed_len > state.committed_len:
                 control_batch.verify_commit_messages.append(
@@ -378,7 +387,6 @@ class DecoupledVerifyManager:
                     )
                 )
                 state.committed_len = committed_len
-        expected[state.pool_idx] = state.total_committed_len
 
     def _account_select_hits(self, batch: ScheduleBatch) -> None:
         hits = self.verify_worker.last_select_hits
