@@ -125,9 +125,11 @@ class DecoupledVerifyManager:
         self.ipc_config = ipc_config
         self.verify_worker = verify_worker
         self.arrival_board = EnumArrivalBoard()
-        # M:N drafter-assignment policy is out of scope; everything routes to
-        # drafter rank 0 (the 1:1 topology).
-        self.dst_drafter_rank = 0
+        # 1:N seat sharding: each seat is owned by one drafter for its whole
+        # occupancy (stable modulo assignment); a seat change re-syncs on the
+        # new owner and closes on the old one. Full M:N policy stays out of
+        # scope.
+        self.num_drafters = max(1, len(ipc_config.connect_endpoints))
 
         self._rid_states: dict[str, _ReqState] = {}
         self.enum_round_ct = 0
@@ -251,7 +253,7 @@ class DecoupledVerifyManager:
         self.scripted_drafter = ScriptedFakeDrafter(
             transport=drafter_transport,
             verifier_rank=self.ipc_config.rank,
-            drafter_rank=self.dst_drafter_rank,
+            drafter_rank=0,
             num_steps=self.verify_worker.speculative_num_steps,
             fanout=self.verify_worker.speculative_fanout,
             mode=mode,
@@ -284,16 +286,17 @@ class DecoupledVerifyManager:
         if not batch.reqs:
             return
         t_in = time.monotonic() if self._profile else 0.0
-        control_batch = DraftControlBatch(dst_drafter_rank=self.dst_drafter_rank)
+        control_batches: dict[int, DraftControlBatch] = {}
         expected: dict[int, int] = {}
         for req in batch.reqs:
-            self._collect_req_controls(req, control_batch, expected)
-        if (
-            control_batch.sync_messages
-            or control_batch.verify_commit_messages
-            or control_batch.close_messages
-        ):
-            self.ipc_thread.submit_control_batch(control_batch)
+            self._collect_req_controls(req, control_batches, expected)
+        for control_batch in control_batches.values():
+            if (
+                control_batch.sync_messages
+                or control_batch.verify_commit_messages
+                or control_batch.close_messages
+            ):
+                self.ipc_thread.submit_control_batch(control_batch)
         self._account_select_hits(batch)
         t_wait = time.monotonic() if self._profile else 0.0
         if expected and self.arrival_wait_s > 0:
@@ -324,20 +327,34 @@ class DecoupledVerifyManager:
                     )
             self._prof_last_exit = t_out
 
+    def _drafter_rank_of(self, pool_idx: int) -> int:
+        return int(pool_idx) % self.num_drafters
+
+    def _control_batch_for(
+        self, control_batches: dict[int, DraftControlBatch], drafter_rank: int
+    ) -> DraftControlBatch:
+        batch = control_batches.get(drafter_rank)
+        if batch is None:
+            batch = DraftControlBatch(dst_drafter_rank=drafter_rank)
+            control_batches[drafter_rank] = batch
+        return batch
+
     def _collect_req_controls(
         self,
         req: Req,
-        control_batch: DraftControlBatch,
+        control_batches: dict[int, DraftControlBatch],
         expected: dict[int, int],
     ) -> None:
         state = self._rid_states.get(req.rid)
         if req.finished():
             if state is not None:
-                control_batch.close_messages.append(
+                self._control_batch_for(
+                    control_batches, self._drafter_rank_of(state.pool_idx)
+                ).close_messages.append(
                     DraftClose(
                         request_id=req.rid,
                         src_verifier_rank=self.ipc_config.rank,
-                        dst_drafter_rank=self.dst_drafter_rank,
+                        dst_drafter_rank=self._drafter_rank_of(state.pool_idx),
                         reason="finished",
                     )
                 )
@@ -347,7 +364,21 @@ class DecoupledVerifyManager:
         if state is None or state.pool_idx != req.req_pool_idx:
             # New request, or a retraction re-admit moved its seat: (re-)open
             # with the full committed prefix and poison the seat's stamp so the
-            # previous occupant's landed block cannot look fresh.
+            # previous occupant's landed block cannot look fresh. A seat move
+            # can also change the owning drafter -- close on the old one.
+            if state is not None:
+                old_rank = self._drafter_rank_of(state.pool_idx)
+                if old_rank != self._drafter_rank_of(req.req_pool_idx):
+                    self._control_batch_for(
+                        control_batches, old_rank
+                    ).close_messages.append(
+                        DraftClose(
+                            request_id=req.rid,
+                            src_verifier_rank=self.ipc_config.rank,
+                            dst_drafter_rank=old_rank,
+                            reason="reseated",
+                        )
+                    )
             self.verify_worker.enum_buffer.reset_slot(req.req_pool_idx)
             state = _ReqState(
                 pool_idx=req.req_pool_idx,
@@ -355,11 +386,12 @@ class DecoupledVerifyManager:
                 committed_len=len(req.output_ids),
             )
             self._rid_states[req.rid] = state
-            control_batch.sync_messages.append(
+            drafter_rank = self._drafter_rank_of(req.req_pool_idx)
+            self._control_batch_for(control_batches, drafter_rank).sync_messages.append(
                 DraftSync(
                     request_id=req.rid,
                     src_verifier_rank=self.ipc_config.rank,
-                    dst_drafter_rank=self.dst_drafter_rank,
+                    dst_drafter_rank=drafter_rank,
                     req_pool_idx=req.req_pool_idx,
                     prompt_token_ids=list(req.origin_input_ids),
                     committed_outputs=list(req.output_ids),
@@ -377,11 +409,14 @@ class DecoupledVerifyManager:
             expected[state.pool_idx] = state.total_committed_len
             committed_len = len(req.output_ids)
             if committed_len > state.committed_len:
-                control_batch.verify_commit_messages.append(
+                drafter_rank = self._drafter_rank_of(state.pool_idx)
+                self._control_batch_for(
+                    control_batches, drafter_rank
+                ).verify_commit_messages.append(
                     VerifyCommit(
                         request_id=req.rid,
                         src_verifier_rank=self.ipc_config.rank,
-                        dst_drafter_rank=self.dst_drafter_rank,
+                        dst_drafter_rank=drafter_rank,
                         pre_verify_committed_len=state.committed_len,
                         committed_tokens=list(req.output_ids[state.committed_len :]),
                     )
