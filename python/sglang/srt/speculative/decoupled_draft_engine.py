@@ -272,6 +272,15 @@ class EnumDraftEngine:
                 return True
             self._rollback_prerun(state)
             self.prerun_miss_ct += 1
+            if self.prerun_miss_ct <= 3:
+                # Alignment probe: a systematic construction/compare bug shows
+                # up in the first few misses (bet vs real delta side by side).
+                logger.info(
+                    "prerun miss #%d: bet=%s delta=%s",
+                    self.prerun_miss_ct,
+                    bet[:8],
+                    delta[:8],
+                )
         state.committed_tokens.extend(delta)
         return False
 

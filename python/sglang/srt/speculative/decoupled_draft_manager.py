@@ -83,6 +83,9 @@ class DecoupledDraftManager:
         self._enable_top1_prerun = (
             envs.SGLANG_ENABLE_DECOUPLED_TOP1_PRERUN.get() and data_transport == "zmq"
         )
+        # Seats eligible for an idle-window bet (filled after each answered
+        # commit, consumed by _run_preruns).
+        self._prerun_keys: dict[DraftReqKey, None] = {}
 
         self.ipc_block_pool = None
         if data_transport == "cuda_ipc":
@@ -117,7 +120,13 @@ class DecoupledDraftManager:
                 )
             )
             if ready.is_empty():
-                time.sleep(_IDLE_WAIT_S)
+                # Idle window = the verifier's in-flight round: the only time
+                # a top-1 prerun may run. Betting inline after a real round
+                # would delay draining the next commit and stall the pipeline.
+                if self._enable_top1_prerun and self._prerun_keys:
+                    self._run_preruns()
+                else:
+                    time.sleep(_IDLE_WAIT_S)
                 continue
             try:
                 self._apply_controls_and_draft(ready)
@@ -182,16 +191,21 @@ class DecoupledDraftManager:
                     )
             self._push_block(verifier_rank=verifier_rank, packed=packed)
         if self._enable_top1_prerun:
-            by_verifier_prerun: dict[int, list[DraftReqKey]] = {}
             for draft_key in list(touched) + list(confirmed):
-                by_verifier_prerun.setdefault(draft_key.src_verifier_rank, []).append(
-                    draft_key
-                )
-            for verifier_rank, draft_keys in by_verifier_prerun.items():
-                packed = self.engine.speculative_prerun(draft_keys)
-                self._push_block(
-                    verifier_rank=verifier_rank, packed=packed, speculative=True
-                )
+                self._prerun_keys[draft_key] = None
+
+    def _run_preruns(self) -> None:
+        """Idle-window top-1 bets for the seats whose last commit was already
+        answered (real block pushed or bet confirmed)."""
+        by_verifier: dict[int, list[DraftReqKey]] = {}
+        for draft_key in self._prerun_keys:
+            by_verifier.setdefault(draft_key.src_verifier_rank, []).append(draft_key)
+        self._prerun_keys.clear()
+        for verifier_rank, draft_keys in by_verifier.items():
+            packed = self.engine.speculative_prerun(draft_keys)
+            self._push_block(
+                verifier_rank=verifier_rank, packed=packed, speculative=True
+            )
 
     def _push_block(
         self, *, verifier_rank: int, packed, speculative: bool = False
