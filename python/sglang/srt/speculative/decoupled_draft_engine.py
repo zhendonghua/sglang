@@ -20,6 +20,11 @@ All scratch state (rows + KV slots written for backbone / branch tokens) is
 freed at the end of the round: a wrong branch is never selected, and the next
 commit re-extends from the committed prefix (keep-winning-branch KV is a
 listed future optimization).
+
+A miss round (the commit fell outside the last block) collapses to case 0:
+the verifier's select missed the same block the same way and falls back, so
+the next commit can only be a single bonus -- only the F case-0 chains are
+drafted and the dead cells are poisoned (see ``_case0_round``).
 """
 
 from __future__ import annotations
@@ -337,7 +342,9 @@ class EnumDraftEngine:
                 state is None
                 or state.prerun_len > 0
                 or state.last_units_host is None
-                or state.last_backbone_host is None
+                # Empty after a case-0 miss round: that block carries no
+                # backbone, so there is no full-accept outcome to bet.
+                or not state.last_backbone_host
                 or key not in self._seat_carriers
             ):
                 continue
@@ -385,16 +392,21 @@ class EnumDraftEngine:
         arrays {pool_indices, base_committed_lens, tokens} or None if no key
         is live. Frees every scratch slot before returning.
 
-        Two forms of the same tree, mixed PER SEAT within one call:
+        Three forms of the same tree, mixed PER SEAT within one call:
 
         - **glue fast path** (this seat's commit matched a unit of its last
           block): the winning unit's chain IS the new backbone (greedy
           re-draft is deterministic), so one K-row extend re-materializes
           its KV and yields all node logits; the branch phase runs as plain
           decode replays assembled from the seat's retained carrier rows.
-        - **slow path** (first round / miss / no carrier): the original
-          build-everything round for the missing seats only; it also
-          (re)builds their seat carriers and host mirrors.
+        - **case-0 miss round** (commit fell outside the last block, carrier
+          exists): a drafter miss mirrors a verifier select miss, so the
+          next commit is necessarily a single fallback bonus -- only the
+          case-0 rows of this block can ever be read. Enumerate just those
+          F chains on the carrier rows and poison the dead cells.
+        - **bootstrap** (no carrier yet): the original build-everything
+          round for the fresh seats only; it also builds their seat
+          carriers and host mirrors.
         """
         keys = [key for key in keys if key in self._states]
         if not keys:
@@ -406,8 +418,10 @@ class EnumDraftEngine:
             hit_keys: list[DraftReqKey] = []
             hit_states: list[_DraftReqState] = []
             selections: list[tuple[int, int]] = []
-            miss_keys: list[DraftReqKey] = []
-            miss_states: list[_DraftReqState] = []
+            case0_keys: list[DraftReqKey] = []
+            case0_states: list[_DraftReqState] = []
+            slow_keys: list[DraftReqKey] = []
+            slow_states: list[_DraftReqState] = []
             for key in keys:
                 state = self._states[key]
                 selection = self._match_seat(key, state)
@@ -415,9 +429,12 @@ class EnumDraftEngine:
                     hit_keys.append(key)
                     hit_states.append(state)
                     selections.append(selection)
+                elif key in self._seat_carriers:
+                    case0_keys.append(key)
+                    case0_states.append(state)
                 else:
-                    miss_keys.append(key)
-                    miss_states.append(state)
+                    slow_keys.append(key)
+                    slow_states.append(state)
             parts: list[dict] = []
             if hit_states:
                 self.hit_ct += 1
@@ -430,22 +447,32 @@ class EnumDraftEngine:
                         scratch_slots,
                     )
                 )
-            if miss_states:
+            if case0_states or slow_states:
                 self.miss_ct += 1
+            if case0_states:
+                parts.append(
+                    self._case0_round(
+                        case0_keys, case0_states, scratch_batches, scratch_slots
+                    )
+                )
+            if slow_states:
                 parts.append(
                     self._slow_round(
-                        miss_keys, miss_states, scratch_batches, scratch_slots
+                        slow_keys, slow_states, scratch_batches, scratch_slots
                     )
                 )
             if len(parts) == 1:
                 return parts[0]
             return {
-                "pool_indices": parts[0]["pool_indices"] + parts[1]["pool_indices"],
-                "base_committed_lens": parts[0]["base_committed_lens"]
-                + parts[1]["base_committed_lens"],
-                "units_device": torch.cat(
-                    [parts[0]["units_device"], parts[1]["units_device"]]
-                ),
+                "pool_indices": [
+                    pool_idx for part in parts for pool_idx in part["pool_indices"]
+                ],
+                "base_committed_lens": [
+                    base_len
+                    for part in parts
+                    for base_len in part["base_committed_lens"]
+                ],
+                "units_device": torch.cat([part["units_device"] for part in parts]),
             }
         finally:
             self._free_scratch(scratch_batches, scratch_slots)
@@ -455,7 +482,7 @@ class EnumDraftEngine:
         self, key: DraftReqKey, state: _DraftReqState
     ) -> Optional[tuple[int, int]]:
         """Match one seat's pending delta against its last block; returns the
-        winning (accept_case, fanout_index) or None (seat runs slow)."""
+        winning (accept_case, fanout_index) or None (seat misses)."""
         if not self._enable_glue_fast_path:
             return None
         if key not in self._seat_carriers:
@@ -693,6 +720,111 @@ class EnumDraftEngine:
             )
             offset += new_len
         self.profiler.mark("commit_slots")
+
+    def _case0_round(
+        self,
+        keys: list[DraftReqKey],
+        states: list[_DraftReqState],
+        scratch_batches: list[ScheduleBatch],
+        scratch_slots: list[torch.Tensor],
+    ) -> dict:
+        """Miss round collapsed to case 0 (the dead-cell theorem).
+
+        The drafter and the verifier judge the same (block, delta) pair, so a
+        drafter miss means the verifier's select missed too and fell back to a
+        plain decode: the NEXT commit is a single case-0 bonus, and every
+        case >= 1 cell of this block is dead. (If the fallback's junk drafts
+        happen to be target-agreeing the next delta can still be longer; it
+        then simply misses again -- one wasted round, never a wrong token.)
+
+        So: advance the delta, take the top-F node-0 guesses, and run ONE
+        F-row decode chain on the carrier's case-0 rows (which carry no
+        backbone prefix -- their sequences start at the committed length).
+        No backbone, no glue, no carrier rebuild; dead guess cells are
+        poisoned with -1 (matches nothing on either side) and dead chains
+        with 0 (never read behind a poisoned guess).
+        """
+        num_steps, fanout = self.num_steps, self.fanout
+        bs = len(states)
+        carriers = [self._seat_carriers[key] for key in keys]
+        pool = self.model_runner.req_to_token_pool
+
+        # -- Advance the committed prefix; last logits = node 0 --------------
+        base_lens = [state.committed_slots.numel() for state in states]
+        advance_batch, advance_slots = self._extend_batch(
+            token_lists=[state.committed_tokens for state in states],
+            prefix_slots=[state.committed_slots for state in states],
+            tag="advance",
+        )
+        scratch_batches.append(advance_batch)
+        node0_logits = self._forward(advance_batch, tag="advance")
+        # Consume the graph runner's static logits buffer before the next
+        # forward overwrites it.
+        node0_guesses = torch.topk(node0_logits, fanout, dim=-1).indices  # [bs, F]
+        self._absorb_advance_slots(states, advance_slots)
+
+        # -- Carrier rows only need the committed delta (no backbone) --------
+        for i, (state, carrier) in enumerate(zip(states, carriers)):
+            new_len = state.committed_slots.numel()
+            synced = min(carrier.synced_len, base_lens[i])
+            pool.req_to_token[carrier.all_rows, synced:new_len] = state.committed_slots[
+                synced:new_len
+            ].to(torch.int32)
+            carrier.synced_len = new_len
+        self.profiler.mark("case0_sync")
+
+        # -- Case-0 chains: per seat, the first F carrier rows ---------------
+        branch = self._branch_template
+        branch.reqs = [
+            req for carrier in carriers for req in carrier.branch_reqs[:fanout]
+        ]
+        branch.req_pool_indices = (
+            torch.cat([carrier.branch_rows[:fanout] for carrier in carriers])
+            if bs > 1
+            else carriers[0].branch_rows[:fanout]
+        )
+        seq_host = [
+            state.committed_slots.numel() for state in states for _ in range(fanout)
+        ]
+        seq_cpu = torch.tensor(seq_host, dtype=torch.int64)
+        branch.seq_lens = seq_cpu.to(self.device, non_blocking=True)
+        branch.seq_lens_cpu = seq_cpu
+        branch.seq_lens_sum = None
+        branch.orig_seq_lens = branch.seq_lens.to(torch.int32)
+        self.profiler.mark("case0_mut")
+        logits, step_slots = self._decode_step(
+            branch, node0_guesses.reshape(-1), tag="case0"
+        )
+        scratch_slots.append(step_slots)
+        chain_steps: list[torch.Tensor] = [logits.argmax(dim=-1)]
+        for _ in range(num_steps - 1):
+            logits, step_slots = self._decode_step(branch, chain_steps[-1], tag="case0")
+            scratch_slots.append(step_slots)
+            chain_steps.append(logits.argmax(dim=-1))
+
+        # -- Expand to full-size units; poison the dead cells ----------------
+        guesses_stack = torch.full(
+            (bs, num_steps + 1, fanout),
+            -1,
+            dtype=node0_guesses.dtype,
+            device=self.device,
+        )
+        guesses_stack[:, 0] = node0_guesses
+        full_steps: list[torch.Tensor] = []
+        for step in chain_steps:
+            full_step = torch.zeros(
+                (bs, num_steps + 1, fanout), dtype=step.dtype, device=self.device
+            )
+            full_step[:, 0] = step.view(bs, fanout)
+            full_steps.append(full_step.view(-1))
+        # No backbone this round: only a case-0 match can hit next round, and
+        # a case-0 hit reads its chain from the units mirror, not the backbone.
+        return self._pack_and_mirror(
+            states=states,
+            guesses_stack=guesses_stack,
+            chain_steps=full_steps,
+            new_backbones=[[] for _ in states],
+        )
 
     def _slow_round(
         self,

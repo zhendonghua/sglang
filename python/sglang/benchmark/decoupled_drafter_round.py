@@ -115,12 +115,15 @@ class _VerifierSim:
     def next_delta(self, units: list, *, force_miss: bool) -> list[int]:
         """units = last block's [K+1][F][K+1] host list; returns the commit."""
         if self.chain is None:
-            # Last round ran slow: its backbone is the guess-0 column
-            # (c_{a+1} == g_{a,0} on the slow path).
-            num_steps = len(units) - 1
-            self.chain = [units[a][0][0] for a in range(num_steps)]
-        case = min(self.accept_len, len(self.chain))
-        prefix = self.chain[:case]
+            # Last commit missed, so the verifier's select missed the same
+            # way (mirror symmetry) and fell back to a plain decode: this
+            # commit is a single case-0 bonus. (The engine's miss-round block
+            # only carries case 0 anyway -- its dead cells are poisoned.)
+            case = 0
+            prefix: list[int] = []
+        else:
+            case = min(self.accept_len, len(self.chain))
+            prefix = self.chain[:case]
         if force_miss:
             bonus = self.rng.randrange(self.vocab_size)
             self.chain = None
@@ -156,8 +159,11 @@ def _run_rounds(
         round_ms.append(1000.0 * (time.monotonic() - start))
         assert packed is not None and packed["units_device"].shape[0] == len(keys)
         units_host = packed["units_device"].cpu().tolist()
-        for i, key in enumerate(keys):
-            last_units[key] = units_host[i]
+        # Mixed rounds pack seats in subround partition order (hit, case-0,
+        # bootstrap), not keys order -- route each block by its echoed seat,
+        # exactly like the verifier's pool-indexed landing.
+        for pool_idx, units in zip(packed["pool_indices"], units_host):
+            last_units[keys[pool_idx]] = units
     return round_ms
 
 
@@ -206,10 +212,16 @@ def _compare_engines(
             paths[name] = "fast" if engine.hit_ct > hits_before else "slow"
             lens[name] = packed["base_committed_lens"][0]
             units[name] = packed["units_device"][0].cpu().tolist()
-        if units["fast"] != units["slow"]:
+        # The fast engine's miss round is case-0 collapsed (dead cells
+        # poisoned) while the slow reference engine always enumerates the
+        # full block, so only the case-0 rows are comparable then.
+        fast_is_case0 = args.num_steps >= 1 and units["fast"][1][0][0] == -1
+        fast_rows = units["fast"][:1] if fast_is_case0 else units["fast"]
+        slow_rows = units["slow"][:1] if fast_is_case0 else units["slow"]
+        if fast_rows != slow_rows:
             mismatch_rounds += 1
             diffs = []
-            for case, (uf_row, us_row) in enumerate(zip(units["fast"], units["slow"])):
+            for case, (uf_row, us_row) in enumerate(zip(fast_rows, slow_rows)):
                 for f, (uf, us) in enumerate(zip(uf_row, us_row)):
                     if uf != us:
                         first_pos = next(
@@ -217,11 +229,13 @@ def _compare_engines(
                         )
                         diffs.append((case, f, first_pos))
             logger.info(
-                "round %d MISMATCH paths=%s diff_units=%d/%d at(case,f,pos)=%s",
+                "round %d MISMATCH paths=%s case0_only=%s diff_units=%d/%d "
+                "at(case,f,pos)=%s",
                 r,
                 paths,
+                fast_is_case0,
                 len(diffs),
-                sum(len(row) for row in units["fast"]),
+                sum(len(row) for row in fast_rows),
                 diffs[:8],
             )
             case, f, _ = diffs[0]
@@ -253,13 +267,16 @@ def main() -> None:
     if args.profile:
         envs.SGLANG_DEBUG_DECOUPLED_DRAFT_PROFILE.set(True)
 
-    # The drafter's engine sizes its decode batches at bs and bs*(K+1)*F rows;
-    # make sure both have a captured decode graph.
+    # The drafter's engine sizes its decode batches at bs (backbone), bs*F
+    # (case-0 miss rounds), and bs*(K+1)*F rows (branch chains); make sure
+    # each has a captured decode graph.
     branch_rows = args.batch_size * (args.num_steps + 1) * args.fanout
     server_args_kwargs = dict(
         model_path=args.model_path,
         mem_fraction_static=args.mem_fraction_static,
-        cuda_graph_bs_decode=sorted({args.batch_size, branch_rows}),
+        cuda_graph_bs_decode=sorted(
+            {args.batch_size, args.batch_size * args.fanout, branch_rows}
+        ),
         disable_cuda_graph=args.disable_cuda_graph,
     )
     if args.attention_backend is not None:
