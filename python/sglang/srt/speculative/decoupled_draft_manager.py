@@ -86,6 +86,18 @@ class DecoupledDraftManager:
         # Seats eligible for an idle-window bet (filled after each answered
         # commit, consumed by _run_preruns).
         self._prerun_keys: dict[DraftReqKey, None] = {}
+        # Adaptive fanout: keep the round time inside the verifier's enum-wait
+        # budget by halving / restoring the engine's effective width. Only
+        # meaningful under a positive wait gate (sync pacing).
+        wait_ms = envs.SGLANG_DECOUPLED_ENUM_WAIT_MS.get()
+        self._adaptive_fanout = (
+            envs.SGLANG_ENABLE_DECOUPLED_ADAPTIVE_FANOUT.get()
+            and wait_ms > 0
+            and self.fanout > 1
+        )
+        self._fanout_budget_ms = 0.75 * wait_ms
+        self._round_ewma_ms: float | None = None
+        self._rounds_since_fanout_change = 0
 
         self.ipc_block_pool = None
         if data_transport == "cuda_ipc":
@@ -169,18 +181,22 @@ class DecoupledDraftManager:
         for verifier_rank, draft_keys in by_verifier.items():
             round_start = time.monotonic()
             packed = self.engine.draft_round(draft_keys)
+            round_s = time.monotonic() - round_start
             self._round_ct += 1
-            self._round_time_s += time.monotonic() - round_start
+            self._round_time_s += round_s
+            self._maybe_adjust_fanout(round_ms=1000.0 * round_s)
             if self._round_ct % 200 == 0:
                 logger.info(
                     "decoupled drafter rounds: ct=%d avg_ms=%.1f push_ms=%.2f "
-                    "last_bs=%d fast=%d slow=%d prerun_hit=%d prerun_miss=%d",
+                    "last_bs=%d fast=%d slow=%d eff_fanout=%d "
+                    "prerun_hit=%d prerun_miss=%d",
                     self._round_ct,
                     1000.0 * self._round_time_s / self._round_ct,
                     1000.0 * self._push_time_s / self._round_ct,
                     len(draft_keys),
                     self.engine.hit_ct,
                     self.engine.miss_ct,
+                    self.engine.effective_fanout,
                     self.engine.prerun_hit_ct,
                     self.engine.prerun_miss_ct,
                 )
@@ -193,6 +209,45 @@ class DecoupledDraftManager:
         if self._enable_top1_prerun:
             for draft_key in list(touched) + list(confirmed):
                 self._prerun_keys[draft_key] = None
+
+    def _maybe_adjust_fanout(self, *, round_ms: float) -> None:
+        """Feedback controller for the engine's effective fanout.
+
+        Halve the enumeration width when the round-time EWMA threatens the
+        verifier's enum-wait budget (a blown gate collapses the accept length
+        batch-wide -- far worse than a narrower block); restore it once rounds
+        run comfortably inside the budget. The 0.35 restore threshold plus the
+        cooldown gives ~2x hysteresis, so the controller settles instead of
+        oscillating around the budget.
+        """
+        if not self._adaptive_fanout:
+            return
+        ewma = self._round_ewma_ms
+        self._round_ewma_ms = round_ms if ewma is None else 0.7 * ewma + 0.3 * round_ms
+        self._rounds_since_fanout_change += 1
+        if self._rounds_since_fanout_change < 8:
+            return
+        current = self.engine.effective_fanout
+        new_fanout = current
+        if self._round_ewma_ms > self._fanout_budget_ms and current > 1:
+            new_fanout = max(1, current // 2)
+        elif (
+            self._round_ewma_ms < 0.35 * self._fanout_budget_ms
+            and current < self.fanout
+        ):
+            new_fanout = min(self.fanout, current * 2)
+        if new_fanout == current:
+            return
+        logger.info(
+            "decoupled adaptive fanout: %d -> %d (round_ewma=%.1fms budget=%.1fms)",
+            current,
+            new_fanout,
+            self._round_ewma_ms,
+            self._fanout_budget_ms,
+        )
+        self.engine.effective_fanout = new_fanout
+        self._rounds_since_fanout_change = 0
+        self._round_ewma_ms = None  # re-learn at the new width
 
     def _run_preruns(self) -> None:
         """Idle-window top-1 bets for the seats whose last commit was already

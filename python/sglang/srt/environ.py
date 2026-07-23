@@ -366,6 +366,20 @@ class Envs:
     # the shared prefix once per seat instead of once per row). Below ~4k the
     # prefix lives in L2 and cascade only adds overhead. 0 disables.
     SGLANG_DECOUPLED_CASCADE_MIN_PREFIX_LEN = EnvInt(0)
+    # Decoupled spec: mask each accept case's dead bonus guess before the
+    # drafter's top-F. Case a < K is only ever reached by verify REJECTING
+    # backbone draft c_{a+1}, so that token can never be the case's bonus;
+    # excluding it lets a live candidate into the guess row (F2 doubles its
+    # effective width). Glue-fast-path rounds only: a bootstrap block serves
+    # a freely sampled first bonus and keeps the unmasked top-F.
+    SGLANG_ENABLE_DECOUPLED_DEAD_GUESS_EXCLUSION = EnvBool(True)
+    # Decoupled spec: drafter-side feedback controller that halves / restores
+    # the effective enumeration fanout so the round time stays inside the
+    # verifier's enum-wait budget (large batch x long prefix otherwise blows
+    # the gate and collapses the accept length). Unused guess columns are
+    # poisoned in the fixed-shape block, so the verifier needs no change.
+    # Active only when SGLANG_DECOUPLED_ENUM_WAIT_MS > 0.
+    SGLANG_ENABLE_DECOUPLED_ADAPTIVE_FANOUT = EnvBool(True)
 
     # Scheduler: memory leak test
     SGLANG_TEST_RETRACT = EnvBool(False)

@@ -91,6 +91,13 @@ def _parse_args() -> argparse.Namespace:
         help="Correctness mode: drive a fast-path engine and a slow-path "
         "engine with identical commits and diff their blocks each round.",
     )
+    parser.add_argument(
+        "--effective-fanout",
+        type=int,
+        default=None,
+        help="Pin the engine's effective fanout below --fanout (exercises "
+        "the adaptive-width row subsetting; unused columns ship poisoned).",
+    )
     return parser.parse_args()
 
 
@@ -110,7 +117,14 @@ class _VerifierSim:
         self.rng = rng
         self.vocab_size = vocab_size
         self.chain: Optional[list[int]] = None  # None => last round missed
-        self.pick_f = 1 if fanout > 1 else 0
+
+    @staticmethod
+    def _pick_live_f(row: list) -> int:
+        # Prefer a non-top guess (exercises the f-index matching) among the
+        # live columns; dead cells (adaptive fanout, dead-guess exclusion at
+        # width 1) are poisoned with -1 and can never be a real bonus.
+        live = [f for f, unit in enumerate(row) if unit[0] != -1]
+        return live[1] if len(live) > 1 else live[0]
 
     def next_delta(self, units: list, *, force_miss: bool) -> list[int]:
         """units = last block's [K+1][F][K+1] host list; returns the commit."""
@@ -128,8 +142,9 @@ class _VerifierSim:
             bonus = self.rng.randrange(self.vocab_size)
             self.chain = None
             return prefix + [bonus]
-        bonus = units[case][self.pick_f][0]
-        self.chain = list(units[case][self.pick_f][1:])
+        pick_f = self._pick_live_f(units[case])
+        bonus = units[case][pick_f][0]
+        self.chain = list(units[case][pick_f][1:])
         return prefix + [bonus]
 
 
@@ -175,19 +190,25 @@ def _compare_engines(
 ) -> None:
     """Drive a fast-path and a slow-path engine with identical commits;
     report the first block divergence per round (unit-level diff)."""
+    # Dead-guess exclusion rank-shifts the fast engine's guess rows against
+    # the never-excluding slow reference, so the near-tie comparison runs with
+    # it off on both engines (exclusion itself is validated by e2e accept).
     engines = {
         "fast": EnumDraftEngine(
             model_runner=model_runner,
             num_steps=args.num_steps,
             fanout=args.fanout,
+            exclude_dead_guess=False,
         ),
         "slow": EnumDraftEngine(
             model_runner=model_runner,
             num_steps=args.num_steps,
             fanout=args.fanout,
             enable_glue_fast_path=False,
+            exclude_dead_guess=False,
         ),
     }
+    engines["fast"].effective_fanout = args.effective_fanout or args.fanout
     rng = random.Random(42)
     prompt = [rng.randrange(vocab_size) for _ in range(args.prompt_len)]
     key = DraftReqKey(src_verifier_rank=0, request_id="cmp-0")
@@ -212,30 +233,29 @@ def _compare_engines(
             paths[name] = "fast" if engine.hit_ct > hits_before else "slow"
             lens[name] = packed["base_committed_lens"][0]
             units[name] = packed["units_device"][0].cpu().tolist()
-        # The fast engine's miss round is case-0 collapsed (dead cells
-        # poisoned) while the slow reference engine always enumerates the
-        # full block, so only the case-0 rows are comparable then.
-        fast_is_case0 = args.num_steps >= 1 and units["fast"][1][0][0] == -1
-        fast_rows = units["fast"][:1] if fast_is_case0 else units["fast"]
-        slow_rows = units["slow"][:1] if fast_is_case0 else units["slow"]
-        if fast_rows != slow_rows:
+        # The fast engine poisons dead cells (case-0 collapsed miss blocks,
+        # adaptive-fanout columns) while the slow reference engine always
+        # enumerates the full grid: only live fast units are comparable.
+        diffs = []
+        live_units = 0
+        for case, (uf_row, us_row) in enumerate(zip(units["fast"], units["slow"])):
+            for f, (uf, us) in enumerate(zip(uf_row, us_row)):
+                if uf[0] == -1:
+                    continue
+                live_units += 1
+                if uf != us:
+                    first_pos = next(
+                        p for p, (a, b) in enumerate(zip(uf, us)) if a != b
+                    )
+                    diffs.append((case, f, first_pos))
+        if diffs:
             mismatch_rounds += 1
-            diffs = []
-            for case, (uf_row, us_row) in enumerate(zip(fast_rows, slow_rows)):
-                for f, (uf, us) in enumerate(zip(uf_row, us_row)):
-                    if uf != us:
-                        first_pos = next(
-                            p for p, (a, b) in enumerate(zip(uf, us)) if a != b
-                        )
-                        diffs.append((case, f, first_pos))
             logger.info(
-                "round %d MISMATCH paths=%s case0_only=%s diff_units=%d/%d "
-                "at(case,f,pos)=%s",
+                "round %d MISMATCH paths=%s diff_units=%d/%d at(case,f,pos)=%s",
                 r,
                 paths,
-                fast_is_case0,
                 len(diffs),
-                sum(len(row) for row in fast_rows),
+                live_units,
                 diffs[:8],
             )
             case, f, _ = diffs[0]
@@ -307,6 +327,8 @@ def main() -> None:
         num_steps=args.num_steps,
         fanout=args.fanout,
     )
+    if args.effective_fanout is not None:
+        engine.effective_fanout = args.effective_fanout
     rng = random.Random(42)
     keys = []
     sims: dict[DraftReqKey, _VerifierSim] = {}
