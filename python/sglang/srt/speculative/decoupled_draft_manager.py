@@ -16,7 +16,10 @@ from __future__ import annotations
 
 import logging
 import time
+from functools import partial
 from typing import TYPE_CHECKING
+
+import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.speculative.decoupled_draft_engine import EnumDraftEngine
@@ -29,7 +32,11 @@ from sglang.srt.speculative.decoupled_spec_transport import (
     DecoupledSpecTransportKind,
     build_transport,
 )
-from sglang.srt.speculative.drafter_ipc_thread import DrafterIpcThread
+from sglang.srt.speculative.drafter_ipc_thread import (
+    DrafterIpcThread,
+    EventedDraftBlock,
+    PushStagingRing,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -98,6 +105,14 @@ class DecoupledDraftManager:
         self._fanout_budget_ms = 0.75 * wait_ms
         self._round_ewma_ms: float | None = None
         self._rounds_since_fanout_change = 0
+        # Evented push (ZMQ data plane): pinned staging ring + CUDA event
+        # consumed on the IPC thread, instead of a blocking D2H here.
+        self._push_ring = (
+            PushStagingRing(num_slots=4)
+            if envs.SGLANG_ENABLE_DECOUPLED_EVENTED_PUSH.get()
+            and data_transport == "zmq"
+            else None
+        )
 
         self.ipc_block_pool = None
         if data_transport == "cuda_ipc":
@@ -279,19 +294,55 @@ class DecoupledDraftManager:
             )
             self._push_time_s += time.monotonic() - push_start
             return
-        self.ipc_thread.submit_draft_results(
-            DraftEnumerationBufferBatch(
-                src_drafter_rank=self.ipc_config.rank,
-                dst_verifier_rank=verifier_rank,
-                num_steps=self.num_steps,
-                fanout=self.fanout,
-                pool_indices=packed["pool_indices"],
-                base_committed_lens=packed["base_committed_lens"],
-                tokens=tuple(packed["units_device"].to("cpu").reshape(-1).tolist()),
-                sent_unix_ts=time.time(),
-                speculative=speculative,
-            )
+        header = DraftEnumerationBufferBatch(
+            src_drafter_rank=self.ipc_config.rank,
+            dst_verifier_rank=verifier_rank,
+            num_steps=self.num_steps,
+            fanout=self.fanout,
+            pool_indices=packed["pool_indices"],
+            base_committed_lens=packed["base_committed_lens"],
+            speculative=speculative,
         )
+        units = packed["units_device"]
+        if self._push_ring is not None:
+            # Evented push: enqueue the pinned staging copy, record its event,
+            # and return without waiting for the round's GPU chain to drain --
+            # the IPC thread materializes and sends once the event fires.
+            num_tokens = units.numel()
+            slot = self._push_ring.acquire(num_tokens=num_tokens)
+            if slot is not None:
+                slot.buffer[:num_tokens].copy_(units.reshape(-1), non_blocking=True)
+                event = torch.cuda.Event()
+                event.record()
+                self.ipc_thread.submit_evented_draft_results(
+                    EventedDraftBlock(
+                        header=header,
+                        event=event,
+                        buffer=slot.buffer,
+                        num_tokens=num_tokens,
+                        on_sent=partial(self._push_ring.release, slot),
+                    )
+                )
+                self._push_time_s += time.monotonic() - push_start
+                return
+            # Ring exhausted (not expected at one block per round): fall back
+            # to an inline D2H, but ride the same FIFO so per-seat generation
+            # order is preserved on the wire.
+            header.tokens = tuple(units.to("cpu").reshape(-1).tolist())
+            self.ipc_thread.submit_evented_draft_results(
+                EventedDraftBlock(
+                    header=header,
+                    event=None,
+                    buffer=None,
+                    num_tokens=0,
+                    on_sent=None,
+                )
+            )
+            self._push_time_s += time.monotonic() - push_start
+            return
+        header.tokens = tuple(units.to("cpu").reshape(-1).tolist())
+        header.sent_unix_ts = time.time()
+        self.ipc_thread.submit_draft_results(header)
         self._push_time_s += time.monotonic() - push_start
 
     def close(self) -> None:

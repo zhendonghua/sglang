@@ -380,6 +380,10 @@ class Envs:
     # poisoned in the fixed-shape block, so the verifier needs no change.
     # Active only when SGLANG_DECOUPLED_ENUM_WAIT_MS > 0.
     SGLANG_ENABLE_DECOUPLED_ADAPTIVE_FANOUT = EnvBool(True)
+    # Decoupled spec: ship enumeration blocks through a pinned staging ring +
+    # CUDA event consumed on the drafter's IPC thread (the copy_done pattern)
+    # instead of a blocking D2H on the drafter loop. ZMQ data plane only.
+    SGLANG_ENABLE_DECOUPLED_EVENTED_PUSH = EnvBool(True)
 
     # Scheduler: memory leak test
     SGLANG_TEST_RETRACT = EnvBool(False)

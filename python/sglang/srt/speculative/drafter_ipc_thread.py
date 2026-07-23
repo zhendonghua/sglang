@@ -15,7 +15,11 @@ from __future__ import annotations
 import logging
 import queue
 import threading
-from typing import Callable, Optional
+import time
+from collections import deque
+from typing import Any, Callable, Optional
+
+import msgspec
 
 from sglang.srt.speculative.decoupled_spec_io import (
     DraftControlBatch,
@@ -34,7 +38,56 @@ logger = logging.getLogger(__name__)
 
 # Idle floor only: the loop wakes immediately via _wakeup when a result is
 # queued; this just bounds the fully-idle sleep before re-polling for controls.
+# It doubles as the poll cadence for pending evented blocks' CUDA events.
 DRAFTER_IPC_IDLE_WAIT_TIMEOUT_S = 0.0005  # 0.5ms
+
+
+class EventedDraftBlock(msgspec.Struct):
+    """A block handed off before its token payload reached the host.
+
+    The drafter loop enqueues the staging copy on its stream, records
+    ``event``, and moves on (the copy_done pattern); this thread completes
+    the block off the critical path: event ready -> materialize ``tokens``
+    from the pinned buffer -> send -> release the staging slot.
+    """
+
+    header: DraftEnumerationBufferBatch  # tokens still empty
+    event: Optional[Any]  # duck-typed .query() -> bool; None = ready now
+    buffer: Optional[Any]  # pinned flat int64 tensor, >= num_tokens valid
+    num_tokens: int
+    on_sent: Optional[Callable[[], None]]  # releases the staging slot
+
+
+class _PushStagingSlot(msgspec.Struct):
+    buffer: Optional[Any] = None  # pinned flat int64 tensor, grown on demand
+
+
+class PushStagingRing:
+    """Fixed pool of pinned staging buffers for evented block pushes.
+
+    The drafter loop acquires a slot per push; the IPC thread releases it
+    after the send. The pool bounds host-pinned memory and naturally
+    backpressures (an empty ring falls back to a synchronous push).
+    """
+
+    def __init__(self, *, num_slots: int) -> None:
+        self._free: queue.SimpleQueue[_PushStagingSlot] = queue.SimpleQueue()
+        for _ in range(num_slots):
+            self._free.put(_PushStagingSlot())
+
+    def acquire(self, *, num_tokens: int) -> Optional[_PushStagingSlot]:
+        try:
+            slot = self._free.get_nowait()
+        except queue.Empty:
+            return None
+        if slot.buffer is None or slot.buffer.numel() < num_tokens:
+            import torch
+
+            slot.buffer = torch.empty(num_tokens, dtype=torch.int64, pin_memory=True)
+        return slot
+
+    def release(self, slot: _PushStagingSlot) -> None:
+        self._free.put(slot)
 
 
 class DrafterIpcThread:
@@ -61,6 +114,11 @@ class DrafterIpcThread:
         self._send_queue: queue.SimpleQueue[DraftEnumerationBufferBatch] = (
             queue.SimpleQueue()
         )
+        # Evented blocks: handoff queue (drafter loop -> this thread) plus the
+        # thread-local FIFO whose head gates on its CUDA event. Head-first
+        # consumption keeps per-seat generation order on the wire.
+        self._evented_queue: queue.SimpleQueue[EventedDraftBlock] = queue.SimpleQueue()
+        self._evented_fifo: deque[EventedDraftBlock] = deque()
         self._closed = threading.Event()
         # Wakes the idle loop the instant a result is queued (latency-critical send).
         self._wakeup = threading.Event()
@@ -100,12 +158,21 @@ class DrafterIpcThread:
         self._send_queue.put(result_batch)
         self._wakeup.set()
 
+    def submit_evented_draft_results(self, block: EventedDraftBlock) -> None:
+        if not block.header.pool_indices:
+            if block.on_sent is not None:
+                block.on_sent()
+            return
+        self._evented_queue.put(block)
+        self._wakeup.set()
+
     def _step(self) -> bool:
         """Run one drain cycle (outgoing results + incoming controls).
 
         Returns whether any work was done. Safe to call directly from tests.
         """
         did_work = self._drain_send_queue()
+        did_work = self._drain_evented() or did_work
         did_work = self._drain_incoming() or did_work
         return did_work
 
@@ -167,6 +234,33 @@ class DrafterIpcThread:
                 break
             did_work = True
             self._send_draft_results(result_batch)
+        return did_work
+
+    def _drain_evented(self) -> bool:
+        # drafter -> verifier evented blocks: complete every FIFO-head block
+        # whose staging copy has drained (events record in stream order, so
+        # head-first never deadlocks); a not-yet-ready head is re-polled on
+        # the next cycle (idle floor 0.5ms).
+        did_work = False
+        while True:
+            try:
+                self._evented_fifo.append(self._evented_queue.get_nowait())
+                did_work = True
+            except queue.Empty:
+                break
+        while self._evented_fifo:
+            head = self._evented_fifo[0]
+            if head.event is not None and not head.event.query():
+                break
+            self._evented_fifo.popleft()
+            batch = head.header
+            if head.buffer is not None:
+                batch.tokens = tuple(head.buffer[: head.num_tokens].tolist())
+            batch.sent_unix_ts = time.time()
+            self._send_draft_results(batch)
+            if head.on_sent is not None:
+                head.on_sent()
+            did_work = True
         return did_work
 
     def _send_draft_results(self, result_batch: DraftEnumerationBufferBatch) -> None:

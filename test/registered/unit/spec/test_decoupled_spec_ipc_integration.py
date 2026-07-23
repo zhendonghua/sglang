@@ -312,6 +312,66 @@ class TestDecoupledSpecIpcIntegration(CustomTestCase):
             v_tp.close()
             d_tp.close()
 
+    def test_evented_blocks_gate_on_head_event_and_send_in_fifo_order(self):
+        # Evented push protocol semantics: per-seat generation rotation on the
+        # verifier requires blocks to hit the wire in submit order, and a
+        # block's payload may only be read once its staging copy's event
+        # fired. A "look-ahead" rewrite that sends any ready block past a
+        # not-yet-ready head would reorder generations; a rewrite that skips
+        # the event gate would send a torn payload. Both must fail here.
+        import torch
+
+        from sglang.srt.speculative.drafter_ipc_thread import EventedDraftBlock
+
+        class _FakeEvent:
+            def __init__(self):
+                self.ready = False
+
+            def query(self):
+                return self.ready
+
+        _mesh, v_tp, d_tp, enum_buffer, proxy, token = self._wire()
+        try:
+            head_event = _FakeEvent()
+            head = _block(pool_idx=1, dst=0, tok=0)
+            head.tokens = ()
+            released = []
+            token.submit_evented_draft_results(
+                EventedDraftBlock(
+                    header=head,
+                    event=head_event,
+                    buffer=torch.tensor([100, 101, 102, 103, 999]),
+                    num_tokens=4,
+                    on_sent=lambda: released.append("head"),
+                )
+            )
+            # Second block is ready immediately (event=None, inline payload).
+            token.submit_evented_draft_results(
+                EventedDraftBlock(
+                    header=_block(pool_idx=2, dst=0, tok=200),
+                    event=None,
+                    buffer=None,
+                    num_tokens=0,
+                    on_sent=None,
+                )
+            )
+            # Head not ready: NOTHING may ship (not even the ready second).
+            token._step()
+            proxy._step()
+            self.assertEqual(len(enum_buffer.landed), 0)
+            self.assertEqual(released, [])
+
+            head_event.ready = True
+            token._step()
+            proxy._step()
+            self.assertEqual([b.pool_indices for b in enum_buffer.landed], [[1], [2]])
+            # Payload materialized from the first num_tokens of the buffer.
+            self.assertEqual(enum_buffer.landed[0].tokens, (100, 101, 102, 103))
+            self.assertEqual(released, ["head"])
+        finally:
+            v_tp.close()
+            d_tp.close()
+
     def test_token_run_terminates_loudly_on_malformed_control(self):
         # Mirror of the proxy test on the drafter side: a malformed control
         # envelope makes _route_control_message raise; _run must contain it.
