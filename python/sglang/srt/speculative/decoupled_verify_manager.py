@@ -291,11 +291,12 @@ class DecoupledVerifyManager:
     def wait_for_select_blocks(self, batch: ScheduleBatch) -> None:
         """C6 launch gate: called by the verify worker at decode-launch, just
         before the select gather. Waits -- bounded -- for the block each
-        seat's select is about to read, then arms the NEXT round's expected
-        stamp (this batch's entry seq_lens + 1) from the gated batch itself.
-        A seat with no armed expectation (first decode round, or a backend
-        without CPU seq lens) is simply not gated: its select falls back if
-        the block is not there, never blocks, never errs.
+        seat's select is about to read (its stamp was armed by the LAST
+        on_batch_result that ran before this launch; see the arming note in
+        ``_collect_req_controls``). A seat with no armed expectation (first
+        decode round: under overlap even its DraftSync is still pending) is
+        simply not gated: its select falls back if the block is not there,
+        never blocks, never errs.
         """
         expected: dict[int, int] = {}
         for req in batch.reqs:
@@ -307,13 +308,24 @@ class DecoupledVerifyManager:
             arrived = self.arrival_board.wait_for(expected, self.arrival_wait_s)
             if not arrived:
                 self.sync_wait_timeout_ct += 1
+                if self.sync_wait_timeout_ct <= 5 or self._profile:
+                    # Mismatch probe: a systematic expectation bug shows up in
+                    # the first few timeouts (expected vs landed, side by side).
+                    with self.arrival_board._cond:
+                        landed = {
+                            seat: self.arrival_board._stamps.get(seat)
+                            for seat in expected
+                        }
+                    logger.info(
+                        "decoupled gate timeout #%d: expected=%s landed=%s",
+                        self.sync_wait_timeout_ct,
+                        expected,
+                        landed,
+                    )
         if self._profile:
             # NOTE: this wait lies inside the hook-to-hook loop_ms window, so
             # the timeline log's wall sum double-counts it (debug-only).
             self._prof_wait_ms += 1000.0 * (time.monotonic() - t_wait)
-        if batch.seq_lens_cpu is not None:
-            for i, req in enumerate(batch.reqs):
-                self._gate_expected[req.req_pool_idx] = int(batch.seq_lens_cpu[i]) + 1
 
     def on_batch_result(self, batch: ScheduleBatch) -> None:
         """Forward this round's lifecycle controls (DraftSync / VerifyCommit /
@@ -327,7 +339,9 @@ class DecoupledVerifyManager:
         t_in = time.monotonic() if self._profile else 0.0
         control_batches: dict[int, DraftControlBatch] = {}
         for req in batch.reqs:
-            self._collect_req_controls(req, control_batches)
+            self._collect_req_controls(
+                req, control_batches, overlap=batch.enable_overlap
+            )
         for control_batch in control_batches.values():
             if (
                 control_batch.sync_messages
@@ -375,6 +389,8 @@ class DecoupledVerifyManager:
         self,
         req: Req,
         control_batches: dict[int, DraftControlBatch],
+        *,
+        overlap: bool,
     ) -> None:
         state = self._rid_states.get(req.rid)
         if req.finished():
@@ -436,6 +452,15 @@ class DecoupledVerifyManager:
             # gated batch's entry seq_lens).
             self._gate_expected[state.pool_idx] = state.total_committed_len
         else:
+            # Arm the gate for the NEXT launch. The protocol value is the same
+            # in both modes -- the select of round R reads the block stamped
+            # two commits back (T_{R-2}) -- but which hook is "the last one
+            # before that launch" differs: the synchronous loop processes
+            # round M before launching M+1 (this hook arms gate M+1 ->
+            # PRE-delta total, T_{M-1}), while the overlap loop launches M+1
+            # first and processes M afterwards (this hook arms gate M+2 ->
+            # POST-delta total, T_M).
+            pre_delta_total = state.total_committed_len
             committed_len = len(req.output_ids)
             if committed_len > state.committed_len:
                 drafter_rank = self._drafter_rank_of(state.pool_idx)
@@ -451,6 +476,9 @@ class DecoupledVerifyManager:
                     )
                 )
                 state.committed_len = committed_len
+            self._gate_expected[state.pool_idx] = (
+                state.total_committed_len if overlap else pre_delta_total
+            )
 
     def _account_select_hits(self, batch: ScheduleBatch) -> None:
         if not self.verify_worker.select_hits_queue:
