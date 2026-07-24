@@ -342,6 +342,17 @@ class EnumDraftEngine:
         if state is None:
             return False
         delta = [int(t) for t in committed_tokens]
+        if any(token < 0 for token in delta):
+            # Belt to the verifier-side check: a negative id would reach the
+            # embedding gather and kill the whole drafter with a device
+            # assert. Dropping the commit desyncs only this seat (staleness
+            # fallbacks until the next re-sync), never the process.
+            logger.error(
+                "commit for %s dropped: negative token in delta %s",
+                key.request_id,
+                delta[:8],
+            )
+            return False
         if state.prerun_len > 0:
             bet = state.committed_tokens[-state.prerun_len :]
             if delta == bet:

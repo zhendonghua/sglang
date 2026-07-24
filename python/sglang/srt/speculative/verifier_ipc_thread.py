@@ -220,8 +220,21 @@ class VerifierIpcThread:
                 break
         while self._evented_fifo:
             head = self._evented_fifo[0]
+            # Readiness needs BOTH checks: an assigned-but-not-yet-recorded
+            # CUDA event reports query() == True (CUDA treats an unrecorded
+            # event as complete), so between the scheduler assigning copy_done
+            # and copy_to_cpu() recording it, query alone would let us read
+            # the still-GPU tensors -- graph-static storage the next replay
+            # overwrites (observed as 0x01010101 accept_lens and index-like
+            # "tokens" on long-context runs). copy_to_cpu rebinds the fields
+            # to CPU tensors BEFORE recording, so is_cpu AND query together
+            # imply the pinned data is complete.
             copy_done = head.result.copy_done
-            if copy_done is None or not copy_done.query():
+            if (
+                copy_done is None
+                or not head.result.accept_lens.is_cpu
+                or not copy_done.query()
+            ):
                 break
             missing = [
                 rid
@@ -258,6 +271,20 @@ class VerifierIpcThread:
                 continue
             tokens = next_token_ids[i * stride : i * stride + int(accept_lens[i])]
             if not tokens:
+                continue
+            if any(token < 0 for token in tokens):
+                # A negative id is the verify output's not-accepted padding:
+                # it must never reach the wire (the drafter would gather an
+                # embedding with it and die on a device assert). Skipping the
+                # round only costs staleness fallbacks; the loud log is the
+                # probe for whoever produced it.
+                logger.error(
+                    "evented commit for %s dropped: negative token in accepted "
+                    "run %s (accept_len=%d) -- verify output padding leaked",
+                    rid,
+                    tokens[:8],
+                    int(accept_lens[i]),
+                )
                 continue
             rank = int(pool_idx) % self.num_drafters
             batch = control_batches.get(rank)
