@@ -48,9 +48,16 @@ VERIFIER_IPC_IDLE_WAIT_TIMEOUT_S = 0.001  # 1ms
 
 # A pending evented commit whose DraftSync has not passed through the send
 # queue yet is retried this long before its request is poisoned (no further
-# commits; the seat rides fallbacks until DraftClose). Generous: the sync is
-# normally forwarded within one loop cycle.
-EVENTED_COMMIT_LEDGER_WAIT_S = 2.0
+# commits; the seat rides fallbacks until DraftClose). The genuine race
+# window is under one scheduler iteration (controls drain first), so a tight
+# bound matters: an unseedable head (e.g. a request that never entered the
+# decoupled lifecycle) stalls every commit queued behind it for this long.
+EVENTED_COMMIT_LEDGER_WAIT_S = 0.1
+
+# Ring capacity of recently retired request ids (DraftClose seen): commits of
+# an overlap tail round (launched before the finish was processed) match here
+# and are skipped instantly instead of burning the retry window above.
+CLOSED_RID_RING_CAPACITY = 4096
 
 
 class EventedVerifyCommits(msgspec.Struct):
@@ -107,6 +114,10 @@ class VerifierIpcThread:
         # builds, retired by DraftClose. Owning it here (not mirroring the
         # scheduler's) keeps the wire stream self-consistent by construction.
         self._sent_committed_lens: dict[str, int] = {}
+        # Recently retired rids (bounded ring + set): lets an overlap tail
+        # round's commits be dropped instantly instead of stalling the FIFO.
+        self._closed_rid_ring: deque[str] = deque(maxlen=CLOSED_RID_RING_CAPACITY)
+        self._closed_rids: set[str] = set()
         self.num_drafters = max(1, int(num_drafters))
         self.src_verifier_rank = int(src_verifier_rank)
         self._closed = threading.Event()
@@ -182,8 +193,14 @@ class VerifierIpcThread:
             # request's committed-output total, a DraftClose retires it.
             for sync in batch.sync_messages:
                 self._sent_committed_lens[sync.request_id] = len(sync.committed_outputs)
+                self._closed_rids.discard(sync.request_id)
             for close in batch.close_messages:
                 self._sent_committed_lens.pop(close.request_id, None)
+                if close.request_id not in self._closed_rids:
+                    if len(self._closed_rid_ring) == self._closed_rid_ring.maxlen:
+                        self._closed_rids.discard(self._closed_rid_ring[0])
+                    self._closed_rid_ring.append(close.request_id)
+                    self._closed_rids.add(close.request_id)
             self.transport.send(
                 int(batch.dst_drafter_rank),
                 DraftMeshMessage.from_control_batch(batch),
@@ -206,11 +223,17 @@ class VerifierIpcThread:
             copy_done = head.result.copy_done
             if copy_done is None or not copy_done.query():
                 break
-            missing = [rid for rid in head.rids if rid not in self._sent_committed_lens]
+            missing = [
+                rid
+                for rid in head.rids
+                if rid not in self._sent_committed_lens and rid not in self._closed_rids
+            ]
             if missing:
                 # The round outran its DraftSync (still queued behind us) --
                 # retry briefly; past the window, poisoned rids simply send no
                 # further commits (their seats ride fallbacks until close).
+                # Closed rids (an overlap tail round) never enter `missing`:
+                # the ledger check below drops them instantly.
                 if time.monotonic() - head.submitted_ts < EVENTED_COMMIT_LEDGER_WAIT_S:
                     break
                 logger.warning(
