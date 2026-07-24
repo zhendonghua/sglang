@@ -65,6 +65,13 @@ logger = logging.getLogger(__name__)
 _LOOPBACK_VERIFIER_ENDPOINT = "loopback://decoupled-spec-verifier"
 _LOOPBACK_DRAFTER_ENDPOINT = "loopback://decoupled-spec-drafter"
 
+# Per-drafter quarantine (1:N): this many consecutive gate timeouts mark a
+# drafter sick; its seats are not waited on for the cooldown (one W burned per
+# cooldown instead of per round). Any landed block clears it. Real failover
+# is 5c's job -- this only bounds the damage of a dead peer.
+_QUARANTINE_TIMEOUT_STREAK = 3
+_QUARANTINE_COOLDOWN_S = 5.0
+
 
 class EnumArrivalBoard:
     """Host mirror of landed stamps per seat (daemon writes, scheduler waits).
@@ -147,6 +154,13 @@ class DecoupledVerifyManager:
         # Per-seat expected stamp for the NEXT decode round's select (armed by
         # each gate call from the batch it gated; seeded by DraftSync).
         self._gate_expected: dict[int, int] = {}
+        # Per-drafter health (1:N): a drafter that keeps timing out the gate
+        # is quarantined for a cooldown -- its seats are not waited on (they
+        # ride fallbacks), so a dead or wedged drafter costs one W per
+        # cooldown instead of one W per round. Any landed block from it
+        # clears the quarantine (proof of life).
+        self._drafter_timeout_streaks: dict[int, int] = {}
+        self._drafter_cooldown_until: dict[int, float] = {}
         self.enum_round_ct = 0
         self.enum_hit_ct = 0
         self.sync_wait_timeout_ct = 0
@@ -303,7 +317,33 @@ class DecoupledVerifyManager:
             )
         )
 
+    def _track_drafter_timeouts(
+        self, expected: dict[int, int], landed: dict[int, Optional[int]], *, now: float
+    ) -> None:
+        missing_ranks = {
+            self._drafter_rank_of(seat)
+            for seat, stamp in expected.items()
+            if (landed.get(seat) or -1) < stamp
+        }
+        for rank in missing_ranks:
+            streak = self._drafter_timeout_streaks.get(rank, 0) + 1
+            self._drafter_timeout_streaks[rank] = streak
+            if streak >= _QUARANTINE_TIMEOUT_STREAK:
+                self._drafter_cooldown_until[rank] = now + _QUARANTINE_COOLDOWN_S
+                logger.warning(
+                    "decoupled drafter %d quarantined for %.1fs after %d "
+                    "consecutive gate timeouts (its seats ride fallbacks)",
+                    rank,
+                    _QUARANTINE_COOLDOWN_S,
+                    streak,
+                )
+
     def _on_block_landed(self, block: DraftEnumerationBufferBatch) -> None:
+        # Proof of life clears the drafter's quarantine.
+        rank = int(block.src_drafter_rank)
+        if self._drafter_timeout_streaks.get(rank):
+            self._drafter_timeout_streaks[rank] = 0
+            self._drafter_cooldown_until.pop(rank, None)
         if self._profile and block.sent_unix_ts is not None:
             # Accumulated from the IPC thread; float add races with the
             # scheduler-thread reader are tolerable for debug averages.
@@ -321,24 +361,29 @@ class DecoupledVerifyManager:
         simply not gated: its select falls back if the block is not there,
         never blocks, never errs.
         """
+        now = time.monotonic()
         expected: dict[int, int] = {}
         for req in batch.reqs:
             stamp = self._gate_expected.get(req.req_pool_idx)
-            if stamp is not None:
-                expected[req.req_pool_idx] = stamp
+            if stamp is None:
+                continue
+            rank = self._drafter_rank_of(req.req_pool_idx)
+            if self._drafter_cooldown_until.get(rank, 0.0) > now:
+                continue  # quarantined drafter: its seats fall back, no wait
+            expected[req.req_pool_idx] = stamp
         t_wait = time.monotonic() if self._profile else 0.0
         if expected and self.arrival_wait_s > 0:
             arrived = self.arrival_board.wait_for(expected, self.arrival_wait_s)
             if not arrived:
                 self.sync_wait_timeout_ct += 1
+                with self.arrival_board._cond:
+                    landed = {
+                        seat: self.arrival_board._stamps.get(seat) for seat in expected
+                    }
+                self._track_drafter_timeouts(expected, landed, now=now)
                 if self.sync_wait_timeout_ct <= 5 or self._profile:
                     # Mismatch probe: a systematic expectation bug shows up in
                     # the first few timeouts (expected vs landed, side by side).
-                    with self.arrival_board._cond:
-                        landed = {
-                            seat: self.arrival_board._stamps.get(seat)
-                            for seat in expected
-                        }
                     logger.info(
                         "decoupled gate timeout #%d: expected=%s landed=%s",
                         self.sync_wait_timeout_ct,
