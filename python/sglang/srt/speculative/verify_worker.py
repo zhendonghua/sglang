@@ -30,8 +30,9 @@ verify only ever accepts tokens the target model itself predicts.
 from __future__ import annotations
 
 import logging
+from collections import deque
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
@@ -79,6 +80,13 @@ class EnumSelectInput(EagleDraftInput):
         has_been_filtered: bool = True,
         new_indices_cpu=None,
     ):
+        # Overlap contract (mirrors EagleDraftInput.filter_batch): survivors'
+        # future_indices are re-gathered from the FutureMap next launch, so
+        # they slice by position regardless of the has_been_filtered prefix
+        # convention below. Unlike the parent we do NOT early-return: the
+        # accept-case / stamp keys live only on this object.
+        if self.future_indices is not None:
+            self.future_indices = self.future_indices[new_indices]
         if has_been_filtered:
             # The verify path already dropped finished rows; keep the prefix.
             keep = len(new_indices)
@@ -91,6 +99,10 @@ class EnumSelectInput(EagleDraftInput):
             self.base_committed_lens = self.base_committed_lens[new_indices]
 
     def merge_batch(self, spec_info: EnumSelectInput):
+        if self.future_indices is not None and spec_info.future_indices is not None:
+            self.future_indices = torch.cat(
+                [self.future_indices, spec_info.future_indices]
+            )
         self.bonus_tokens = torch.cat(
             [self.bonus_tokens, spec_info.bonus_tokens], axis=0
         )
@@ -212,9 +224,15 @@ class VerifyWorker(BaseVerifyWorker):
         # after the scheduler allocates memory pools (alloc_memory_pool below).
         self.enum_buffer: Optional[DecoupledEnumBuffer] = None
 
-        # Select outcome of the last decode round ([bs] bool, GPU); the sync
-        # scheduler mixin consumes it for hit / fallback accounting.
-        self.last_select_hits: Optional[torch.Tensor] = None
+        # Select outcomes per decode round ([bs] bool, GPU), FIFO: the manager
+        # consumes them for hit / fallback accounting. A queue (not a single
+        # slot) because the overlap scheduler defers result processing by one
+        # launch, so two rounds' outcomes can be pending at once.
+        self.select_hits_queue: deque[torch.Tensor] = deque()
+        # C6 launch gate, injected by DecoupledVerifyManager: called with the
+        # batch at decode-launch, before the select gather, to (boundedly)
+        # wait for the enumeration blocks the select is about to read.
+        self.select_gate: Optional[Callable[[ScheduleBatch], None]] = None
 
     def alloc_memory_pool(
         self,
@@ -238,6 +256,12 @@ class VerifyWorker(BaseVerifyWorker):
     ) -> GenerationBatchResult:
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             return self._forward_target_prefill(batch, on_publish)
+
+        # C6 gate: bounded host wait for the blocks this round's select reads.
+        # Under the overlap scheduler this runs while the previous round is
+        # still executing on the GPU, hiding the drafter latency behind it.
+        if self.select_gate is not None and not batch.forward_mode.is_idle():
+            self.select_gate(batch)
 
         verify_input = self._build_verify_input(batch)
         batch.spec_info = verify_input
@@ -279,7 +303,7 @@ class VerifyWorker(BaseVerifyWorker):
 
         select_input: EnumSelectInput = batch.spec_info
         selected, hits = self._select_enum_units(batch, select_input)
-        self.last_select_hits = hits
+        self.select_hits_queue.append(hits)
 
         # The selected unit IS the verify row: [root(=real bonus), K drafts].
         draft_input = EagleDraftInput(

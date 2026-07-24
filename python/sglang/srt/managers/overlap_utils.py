@@ -301,8 +301,16 @@ class FutureMap:
         self._forward_buf_initialized = True
 
         # Spec extras are gated by spec_algo, not by the payload's shape, so a
-        # non-spec stash allocates no extra bufs (only output_tokens_buf).
-        self.need_topk = self.spec_algo.is_some() and self.spec_algo.need_topk()
+        # non-spec stash allocates no extra bufs (only output_tokens_buf). The
+        # one payload-shape exception: the decoupled STANDALONE verifier's
+        # relay never carries topk (its per-round extras ride the spec_info
+        # object, not the FutureMap), so a topk-less first stash must not
+        # allocate/require the topk bufs.
+        self.need_topk = (
+            self.spec_algo.is_some()
+            and self.spec_algo.need_topk()
+            and payload.topk_p is not None
+        )
         self.need_hidden_states = (
             self.spec_algo.is_some()
             and spec_need_hidden_states()

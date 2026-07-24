@@ -10,16 +10,22 @@ manager owns:
   sends ``DraftClose``. A seat change (retraction re-admit) re-syncs the full
   committed prefix -- the drafter-carried pool_idx protocol's only re-sync
   obligation.
-- **Sync-mode pacing** (the C6 host latch, phase 5b form): after forwarding a
-  round's commits, wait -- bounded -- until the next enumeration block of
-  every still-running request has landed, so the next verify round selects
-  instead of falling back. A timeout is never an error: the round degrades to
-  the unified fallback. Phase 6.3 replaces this wait with launch-gating.
-- **Hit / fallback accounting** from the worker's ``last_select_hits``.
+- **The C6 launch gate** (``wait_for_select_blocks``, called by the verify
+  worker at decode-launch, before the select gather): wait -- bounded --
+  until the block each seat's select is about to read has landed. A timeout
+  is never an error: that seat degrades to the unified fallback. Under the
+  overlap scheduler the wait runs while the previous round still executes on
+  the GPU, so up to a full verify round of drafter latency is hidden.
+- **Hit / fallback accounting** from the worker's ``select_hits_queue``.
 
 Expected arrival stamps are pure host math: the drafter stamps a block with
-its total committed length (prompt + committed outputs) at enumeration time,
-which the manager mirrors from its own commit bookkeeping.
+its total committed length (prompt + committed outputs) at enumeration time.
+The block round M's select reads was enumerated two commits back, so its
+stamp equals round M-1's ENTRY seq_lens + 1 -- each gate call arms the next
+round's expectation from the batch it just gated; a DraftSync seeds the
+first one. The first decode round of a request has no armed expectation
+(under overlap its DraftSync has not even been sent when the round
+launches) and simply falls back -- one round per request, by design.
 """
 
 from __future__ import annotations
@@ -132,6 +138,9 @@ class DecoupledVerifyManager:
         self.num_drafters = max(1, len(ipc_config.connect_endpoints))
 
         self._rid_states: dict[str, _ReqState] = {}
+        # Per-seat expected stamp for the NEXT decode round's select (armed by
+        # each gate call from the batch it gated; seeded by DraftSync).
+        self._gate_expected: dict[int, int] = {}
         self.enum_round_ct = 0
         self.enum_hit_ct = 0
         self.sync_wait_timeout_ct = 0
@@ -175,6 +184,8 @@ class DecoupledVerifyManager:
             on_land=self._on_block_landed,
         )
         self.ipc_thread.start()
+        # The worker calls the gate at decode-launch, before its select gather.
+        verify_worker.select_gate = self.wait_for_select_blocks
 
         self._ipc_poll_closed = threading.Event()
         self._ipc_poll_thread: Optional[threading.Thread] = None
@@ -277,19 +288,46 @@ class DecoupledVerifyManager:
             self._prof_transport_ct += 1
         self.arrival_board.record(block)
 
-    def on_batch_result(self, batch: ScheduleBatch) -> None:
-        """Forward this round's lifecycle controls, then pace the next round.
+    def wait_for_select_blocks(self, batch: ScheduleBatch) -> None:
+        """C6 launch gate: called by the verify worker at decode-launch, just
+        before the select gather. Waits -- bounded -- for the block each
+        seat's select is about to read, then arms the NEXT round's expected
+        stamp (this batch's entry seq_lens + 1) from the gated batch itself.
+        A seat with no armed expectation (first decode round, or a backend
+        without CPU seq lens) is simply not gated: its select falls back if
+        the block is not there, never blocks, never errs.
+        """
+        expected: dict[int, int] = {}
+        for req in batch.reqs:
+            stamp = self._gate_expected.get(req.req_pool_idx)
+            if stamp is not None:
+                expected[req.req_pool_idx] = stamp
+        t_wait = time.monotonic() if self._profile else 0.0
+        if expected and self.arrival_wait_s > 0:
+            arrived = self.arrival_board.wait_for(expected, self.arrival_wait_s)
+            if not arrived:
+                self.sync_wait_timeout_ct += 1
+        if self._profile:
+            # NOTE: this wait lies inside the hook-to-hook loop_ms window, so
+            # the timeline log's wall sum double-counts it (debug-only).
+            self._prof_wait_ms += 1000.0 * (time.monotonic() - t_wait)
+        if batch.seq_lens_cpu is not None:
+            for i, req in enumerate(batch.reqs):
+                self._gate_expected[req.req_pool_idx] = int(batch.seq_lens_cpu[i]) + 1
 
-        Runs on the scheduler thread after the batch-result processor appended
-        the round's committed tokens to req.output_ids.
+    def on_batch_result(self, batch: ScheduleBatch) -> None:
+        """Forward this round's lifecycle controls (DraftSync / VerifyCommit /
+        DraftClose). Runs on the scheduler thread after the batch-result
+        processor appended the round's committed tokens to req.output_ids --
+        under the overlap scheduler that is one launch behind the round
+        itself, which only delays the drafter's start, never correctness.
         """
         if not batch.reqs:
             return
         t_in = time.monotonic() if self._profile else 0.0
         control_batches: dict[int, DraftControlBatch] = {}
-        expected: dict[int, int] = {}
         for req in batch.reqs:
-            self._collect_req_controls(req, control_batches, expected)
+            self._collect_req_controls(req, control_batches)
         for control_batch in control_batches.values():
             if (
                 control_batch.sync_messages
@@ -298,18 +336,12 @@ class DecoupledVerifyManager:
             ):
                 self.ipc_thread.submit_control_batch(control_batch)
         self._account_select_hits(batch)
-        t_wait = time.monotonic() if self._profile else 0.0
-        if expected and self.arrival_wait_s > 0:
-            arrived = self.arrival_board.wait_for(expected, self.arrival_wait_s)
-            if not arrived:
-                self.sync_wait_timeout_ct += 1
         if self._profile:
             t_out = time.monotonic()
             if self._prof_last_exit is not None:
                 self._prof_round_ct += 1
                 self._prof_loop_ms += 1000.0 * (t_in - self._prof_last_exit)
-                self._prof_ctl_ms += 1000.0 * (t_wait - t_in)
-                self._prof_wait_ms += 1000.0 * (t_out - t_wait)
+                self._prof_ctl_ms += 1000.0 * (t_out - t_in)
                 if self._prof_round_ct % 200 == 0:
                     ct = self._prof_round_ct
                     logger.info(
@@ -343,7 +375,6 @@ class DecoupledVerifyManager:
         self,
         req: Req,
         control_batches: dict[int, DraftControlBatch],
-        expected: dict[int, int],
     ) -> None:
         state = self._rid_states.get(req.rid)
         if req.finished():
@@ -359,6 +390,7 @@ class DecoupledVerifyManager:
                     )
                 )
                 self._rid_states.pop(req.rid, None)
+                self._gate_expected.pop(state.pool_idx, None)
             return
 
         if state is None or state.pool_idx != req.req_pool_idx:
@@ -368,6 +400,7 @@ class DecoupledVerifyManager:
             # can also change the owning drafter -- close on the old one.
             if state is not None:
                 old_rank = self._drafter_rank_of(state.pool_idx)
+                self._gate_expected.pop(state.pool_idx, None)
                 if old_rank != self._drafter_rank_of(req.req_pool_idx):
                     self._control_batch_for(
                         control_batches, old_rank
@@ -398,15 +431,11 @@ class DecoupledVerifyManager:
                 )
             )
             # A fresh sync re-roots the drafter: the very next round's select
-            # reads the sync-triggered block, so gate on the synced total.
-            expected[state.pool_idx] = state.total_committed_len
+            # reads the sync-triggered block, so seed the gate with the synced
+            # total (subsequent rounds are armed by the gate itself from each
+            # gated batch's entry seq_lens).
+            self._gate_expected[state.pool_idx] = state.total_committed_len
         else:
-            # Gate the NEXT round on the block its select actually reads: the
-            # one enumerated from the PRE-delta state (this round's commit
-            # triggers the block that serves the round AFTER next). Waiting on
-            # the post-delta stamp -- the old behavior -- blocked a full
-            # drafter round-trip every step and serialized draft with verify.
-            expected[state.pool_idx] = state.total_committed_len
             committed_len = len(req.output_ids)
             if committed_len > state.committed_len:
                 drafter_rank = self._drafter_rank_of(state.pool_idx)
@@ -424,12 +453,14 @@ class DecoupledVerifyManager:
                 state.committed_len = committed_len
 
     def _account_select_hits(self, batch: ScheduleBatch) -> None:
-        hits = self.verify_worker.last_select_hits
-        if hits is None or not batch.forward_mode.is_decode_or_idle():
+        if not self.verify_worker.select_hits_queue:
             return
-        self.verify_worker.last_select_hits = None
-        # Sync mode: the result was already D2H-synced by copy_to_cpu, so this
-        # read does not add a stall. 6.3 moves accounting off the host path.
+        if not batch.forward_mode.is_decode_or_idle():
+            return
+        hits = self.verify_worker.select_hits_queue.popleft()
+        # The select ops run at the head of their round's GPU work, which has
+        # long executed by the time this deferred hook runs (the tolist adds
+        # no stall in either scheduler mode).
         hit_list = hits.tolist()
         self.enum_round_ct += len(hit_list)
         self.enum_hit_ct += sum(hit_list)

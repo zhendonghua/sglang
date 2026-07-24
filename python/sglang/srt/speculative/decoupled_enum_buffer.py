@@ -18,10 +18,22 @@ already left lands harmlessly: its seat is either free (nobody gathers it) or
 reused, where reset_slot() at re-assignment plus the stamp mismatch keep it on
 the fallback path.
 
-Phase 1b is SYNC (buf_count == 1: land scatters on the current stream, the caller
-synchronizes before gather). The async overlap form (pinned staging + a private
-copy stream + a double-buffer swap fence) lands in phase 6.3; the API is shaped so
-6.3 only flips buf_count and moves the H2D onto the copy stream.
+Landing runs on the recv daemon thread: pinned staging -> H2D + scatter on a
+private land stream -> host-side event sync, and only then does the caller mark
+the arrival board. "Arrived" therefore means GPU-visible (completed work is
+coherent to every stream), so the gather needs no cross-stream fence.
+
+A single buffer (buf_count == 1) is safe even with the verify forward reading
+concurrently, because the stamp discipline already provides versioning:
+
+- a landing always writes the generation NOT written last, never the one a
+  concurrent gather is consuming (which matched the expected stamp);
+- generation stamps are distinct (each block's base_committed_lens differs by
+  at least the commit delta), so a mid-scatter generation can never satisfy
+  the reader's stamp equality;
+- and the worst possible torn read only ever produces a select MISS (fallback
+  round) or a garbage row that verify rejects token-by-token -- truncate-only
+  correctness never depends on this buffer's contents.
 """
 
 from __future__ import annotations
@@ -49,11 +61,11 @@ class DecoupledEnumBuffer:
         verifier_rank: int,
         enable_overlap: bool,
     ) -> None:
-        if enable_overlap:
-            raise NotImplementedError(
-                "overlap landing needs the async copy-stream + swap fence "
-                "(phase 6.3); run with enable_overlap=False for now"
-            )
+        # The landing path is identical in both scheduler modes (see the module
+        # docstring: host-synced land + stamp versioning make the single buffer
+        # safe under a concurrently reading forward); the flag is kept only for
+        # signature stability.
+        del enable_overlap
         self.device = device
         self.num_steps = int(num_steps)
         self.fanout = int(fanout)
@@ -80,10 +92,20 @@ class DecoupledEnumBuffer:
         # and stamp equality picks the winner.
         self.gen_count = 3
         self._prerun_gen = 2
-        # Double-buffer (mamba idiom, memory_pool.py:849) is the phase 6.3 form;
-        # buf_count is always 1 here (enable_overlap is rejected above).
-        self.buf_count = 2 if enable_overlap else 1
+        # Single buffer by design; versioning lives in the generation stamps
+        # (module docstring), not in slot ping-pong.
+        self.buf_count = 1
         self._write_slot = 0
+        # Landing runs on the recv daemon thread: a private stream keeps the
+        # H2D + scatter off the forward stream (no queueing behind an in-flight
+        # verify), and the pinned staging keeps the H2D truly async. land()
+        # host-syncs the event before returning, so callers may treat a
+        # returned land as GPU-visible.
+        self._land_stream = torch.cuda.Stream(device=device)
+        self._land_event = torch.cuda.Event()
+        self._land_staging: torch.Tensor = torch.empty(
+            (0,), dtype=torch.int64, pin_memory=True
+        )
 
         # int64 matches the forward's token-id convention (input_ids,
         # FutureMap.output_tokens_buf, EagleDraftInput.draft_token are all int64);
@@ -165,24 +187,38 @@ class DecoupledEnumBuffer:
                 f"src_drafter_rank={block.src_drafter_rank}"
             )
 
-        # Reshape the block's flat token tuple once (C-order, so rows_host[i] ==
-        # block.row_tokens(i)); blocking H2D from pageable host (the copy stream
-        # + pinned staging arrive in phase 6.3).
-        pool_indices = torch.tensor(
-            block.pool_indices, dtype=torch.int64, device=self.device
-        )
-        rows = torch.from_numpy(
-            np.asarray(block.tokens, dtype=np.int64).reshape(
-                block.batch_size, block.row_stride
+        # One pinned staging record [tokens | pool_indices | stamps], one async
+        # H2D on the private land stream, then the generation scatter on that
+        # same stream. The host sync below makes the landing GPU-visible before
+        # land() returns -- the caller's arrival marking is the only fence the
+        # gather side ever needs.
+        batch_size = block.batch_size
+        num_tokens = batch_size * block.row_stride
+        staged = num_tokens + 2 * batch_size
+        if self._land_staging.numel() < staged:
+            self._land_staging = torch.empty(
+                (staged,), dtype=torch.int64, pin_memory=True
             )
-        ).to(device=self.device)
-        base_committed_lens = torch.tensor(
-            block.base_committed_lens, dtype=torch.int64, device=self.device
+        staging = self._land_staging
+        staging[:num_tokens] = torch.from_numpy(
+            np.asarray(block.tokens, dtype=np.int64)
         )
-
-        self._scatter_generation(
-            pool_indices, rows, base_committed_lens, speculative=block.speculative
+        staging[num_tokens : num_tokens + batch_size] = torch.tensor(
+            block.pool_indices, dtype=torch.int64
         )
+        staging[num_tokens + batch_size : staged] = torch.tensor(
+            block.base_committed_lens, dtype=torch.int64
+        )
+        with torch.cuda.stream(self._land_stream):
+            staged_dev = staging[:staged].to(self.device, non_blocking=True)
+            rows = staged_dev[:num_tokens].view(batch_size, block.row_stride)
+            pool_indices = staged_dev[num_tokens : num_tokens + batch_size]
+            base_committed_lens = staged_dev[num_tokens + batch_size :]
+            self._scatter_generation(
+                pool_indices, rows, base_committed_lens, speculative=block.speculative
+            )
+            self._land_event.record()
+        self._land_event.synchronize()
 
     def land_rows_device(
         self,

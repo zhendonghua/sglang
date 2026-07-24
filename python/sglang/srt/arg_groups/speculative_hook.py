@@ -229,14 +229,15 @@ def _handle_decoupled_spec(server_args: ServerArgs) -> None:
             role,
         )
 
-    # Synchronous scheduler: the cross-process verify/commit handshake observes
-    # each step before starting the next, which the overlap pipeline may break.
-    # To support overlap, have the decoupled mixin relay per-step results as futures.
-    if not server_args.disable_overlap_schedule:
+    # The VERIFIER runs the overlap scheduler: its cross-round select keys are
+    # GPU tensors relayed like any spec_v2 draft input, block arrival gates the
+    # launch (the verify manager's C6 latch), and commits ride the deferred
+    # batch-result processing. The DRAFTER keeps the synchronous flag: its
+    # dedicated manager loop replaces the scheduler event loop entirely, so
+    # overlap machinery would only add unused state.
+    if is_drafter and not server_args.disable_overlap_schedule:
         server_args.disable_overlap_schedule = True
-        logger.warning(
-            "Overlap scheduler is disabled for decoupled speculative decoding."
-        )
+        logger.warning("Overlap scheduler is disabled for the decoupled drafter.")
 
     # Drafter only.
     # - Radix cache off: the per-commit truncate-to-committed frees the discarded
