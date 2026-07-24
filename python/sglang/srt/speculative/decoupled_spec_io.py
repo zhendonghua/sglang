@@ -281,10 +281,18 @@ class VerifierCommitSegment:
     dst_drafter_rank: int
     pre_verify_committed_len: int
     committed_tokens: list[int] = field(default_factory=list)
+    # Per-round deltas within committed_tokens (one entry per coalesced
+    # VerifyCommit): lets the consumer take exactly one verify round's worth
+    # (generation lockstep) or the whole backlog (catch-up merge).
+    round_lens: list[int] = field(default_factory=list)
 
     @property
     def end_committed_len(self) -> int:
         return int(self.pre_verify_committed_len) + len(self.committed_tokens)
+
+    @property
+    def pending_rounds(self) -> int:
+        return len(self.round_lens)
 
     def append_message(self, message: VerifyCommit) -> None:
         """
@@ -324,6 +332,7 @@ class VerifierCommitSegment:
 
         token_ids = [int(token_id) for token_id in message.committed_tokens]
         self.committed_tokens.extend(token_ids)
+        self.round_lens.append(len(token_ids))
 
     def extract_prefix(self, num_tokens: int) -> VerifierCommitSegment:
         num_tokens = int(num_tokens)
@@ -346,14 +355,31 @@ class VerifierCommitSegment:
         remaining_tokens = [
             int(token_id) for token_id in self.committed_tokens[num_tokens:]
         ]
+        # Split the round boundaries alongside the tokens; a cut inside a
+        # round leaves the remainder as a (shorter) leading round.
+        prefix_rounds: list[int] = []
+        remaining_rounds = list(self.round_lens)
+        taken = 0
+        while remaining_rounds and taken < num_tokens:
+            round_len = remaining_rounds[0]
+            if taken + round_len <= num_tokens:
+                prefix_rounds.append(remaining_rounds.pop(0))
+                taken += round_len
+            else:
+                head = num_tokens - taken
+                prefix_rounds.append(head)
+                remaining_rounds[0] = round_len - head
+                taken = num_tokens
         prefix_segment = VerifierCommitSegment(
             draft_key=self.draft_key,
             dst_drafter_rank=int(self.dst_drafter_rank),
             pre_verify_committed_len=int(self.pre_verify_committed_len),
             committed_tokens=prefix_tokens,
+            round_lens=prefix_rounds,
         )
         self.pre_verify_committed_len = int(self.pre_verify_committed_len) + num_tokens
         self.committed_tokens = remaining_tokens
+        self.round_lens = remaining_rounds
         return prefix_segment
 
 

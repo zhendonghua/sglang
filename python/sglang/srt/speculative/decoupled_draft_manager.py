@@ -45,6 +45,12 @@ logger = logging.getLogger(__name__)
 
 _IDLE_WAIT_S = 0.0005
 
+# Commit backlog (in verify rounds) beyond which the drafter merges the whole
+# backlog to catch up instead of producing every generation; <= this depth is
+# the overlap scheduler's normal in-flight allowance (one in-flight commit
+# plus jitter headroom).
+_CATCH_UP_BACKLOG_ROUNDS = 2
+
 # CUDA IPC slot capacity in block rows; bounds the verifier batch size a
 # single push can carry (the verifier's default running cap is far below it).
 IPC_POOL_MAX_ROWS = 256
@@ -141,9 +147,7 @@ class DecoupledDraftManager:
         while True:
             ready = self.ipc_thread.collect_ready_draft_controls(
                 lambda inbox: inbox.extract_ready_controls_locked(
-                    # The enumeration drafter re-extends from the committed
-                    # prefix, so every commit is consumable in full.
-                    lambda segment: len(segment.committed_tokens)
+                    self._consumable_commit_len
                 )
             )
             if ready.is_empty():
@@ -162,6 +166,25 @@ class DecoupledDraftManager:
                 # affected verifier rounds simply fall back. TODO(5c-class):
                 # quarantine the offending request instead of best-effort.
                 logger.exception("decoupled drafter round failed; controls dropped")
+
+    @staticmethod
+    def _consumable_commit_len(segment) -> int:
+        """Generation lockstep with a catch-up escape hatch.
+
+        Consuming one verify round's delta per drafter round produces EVERY
+        block generation, so the verifier's select always finds the one it
+        needs -- merging commits (the old unconditional behavior) skips
+        generations and each skip costs the verifier a fallback round; under
+        the overlap scheduler those fast fallback rounds outrun the drafter
+        and the skips cascade. A small backlog is normal there (commits flow
+        while a round is in flight); only when the drafter genuinely fell
+        behind does merging the whole backlog become right: one jump, one
+        fallback, re-locked -- instead of dragging a permanent lag whose gate
+        wait would eventually exceed the budget and cascade anyway.
+        """
+        if segment.pending_rounds > _CATCH_UP_BACKLOG_ROUNDS:
+            return len(segment.committed_tokens)
+        return segment.round_lens[0] if segment.round_lens else 0
 
     def _apply_controls_and_draft(self, ready) -> None:
         for draft_key in ready.close_keys:
