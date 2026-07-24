@@ -45,14 +45,16 @@ from sglang.srt.speculative.decoupled_spec_io import (
     DraftControlBatch,
     DraftEnumerationBufferBatch,
     DraftSync,
-    VerifyCommit,
 )
 from sglang.srt.speculative.decoupled_spec_transport import (
     DecoupledSpecTransportKind,
     FakeTransportMesh,
     build_transport,
 )
-from sglang.srt.speculative.verifier_ipc_thread import VerifierIpcThread
+from sglang.srt.speculative.verifier_ipc_thread import (
+    EventedVerifyCommits,
+    VerifierIpcThread,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -186,10 +188,14 @@ class DecoupledVerifyManager:
             transport=transport,
             enum_buffer=verify_worker.enum_buffer,
             on_land=self._on_block_landed,
+            num_drafters=self.num_drafters,
+            src_verifier_rank=ipc_config.rank,
         )
         self.ipc_thread.start()
-        # The worker calls the gate at decode-launch, before its select gather.
+        # The worker calls the gate at decode-launch, before its select gather,
+        # and relays each round's result for evented commit sending.
         verify_worker.select_gate = self.wait_for_select_blocks
+        verify_worker.commit_relay = self._relay_round_commits
 
         self._ipc_poll_closed = threading.Event()
         self._ipc_poll_thread: Optional[threading.Thread] = None
@@ -283,6 +289,19 @@ class DecoupledVerifyManager:
         if self.scripted_drafter is not None:
             self.scripted_drafter.close()
         self.ipc_thread.close()
+
+    def _relay_round_commits(self, batch: ScheduleBatch, batch_result) -> None:
+        """Hand one decode round's result to the IPC thread (copy_done
+        pattern): commits hit the wire at forward end + copy, not when the
+        scheduler thread gets around to the deferred result processing."""
+        self.ipc_thread.submit_evented_commits(
+            EventedVerifyCommits(
+                result=batch_result,
+                rids=[req.rid for req in batch.reqs],
+                pool_indices=[int(req.req_pool_idx) for req in batch.reqs],
+                submitted_ts=time.monotonic(),
+            )
+        )
 
     def _on_block_landed(self, block: DraftEnumerationBufferBatch) -> None:
         if self._profile and block.sent_unix_ts is not None:
@@ -456,6 +475,10 @@ class DecoupledVerifyManager:
             # gated batch's entry seq_lens).
             self._gate_expected[state.pool_idx] = state.total_committed_len
         else:
+            # VerifyCommits ride the evented relay (the IPC thread builds and
+            # sends them at forward end + copy_done); this hook only keeps the
+            # host bookkeeping the gate and re-syncs are built from.
+            #
             # Arm the gate for the NEXT launch. The protocol value is the same
             # in both modes -- the select of round R reads the block stamped
             # two commits back (T_{R-2}) -- but which hook is "the last one
@@ -465,21 +488,7 @@ class DecoupledVerifyManager:
             # first and processes M afterwards (this hook arms gate M+2 ->
             # POST-delta total, T_M).
             pre_delta_total = state.total_committed_len
-            committed_len = len(req.output_ids)
-            if committed_len > state.committed_len:
-                drafter_rank = self._drafter_rank_of(state.pool_idx)
-                self._control_batch_for(
-                    control_batches, drafter_rank
-                ).verify_commit_messages.append(
-                    VerifyCommit(
-                        request_id=req.rid,
-                        src_verifier_rank=self.ipc_config.rank,
-                        dst_drafter_rank=drafter_rank,
-                        pre_verify_committed_len=state.committed_len,
-                        committed_tokens=list(req.output_ids[state.committed_len :]),
-                    )
-                )
-                state.committed_len = committed_len
+            state.committed_len = len(req.output_ids)
             self._gate_expected[state.pool_idx] = (
                 state.total_committed_len if overlap else pre_delta_total
             )

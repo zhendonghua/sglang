@@ -18,13 +18,18 @@ from __future__ import annotations
 import logging
 import queue
 import threading
-from typing import TYPE_CHECKING, Callable, Optional
+import time
+from collections import deque
+from typing import TYPE_CHECKING, Any, Callable, Optional
+
+import msgspec
 
 from sglang.srt.speculative.decoupled_spec_io import (
     DraftControlBatch,
     DraftEnumerationBufferBatch,
     DraftMeshMessage,
     DraftMeshMessageType,
+    VerifyCommit,
 )
 from sglang.srt.speculative.decoupled_spec_transport import (
     BaseDecoupledSpecTransport,
@@ -41,6 +46,29 @@ logger = logging.getLogger(__name__)
 # (<=1ms) control latency is intentional (matches the PR's poll(1ms)).
 VERIFIER_IPC_IDLE_WAIT_TIMEOUT_S = 0.001  # 1ms
 
+# A pending evented commit whose DraftSync has not passed through the send
+# queue yet is retried this long before its request is poisoned (no further
+# commits; the seat rides fallbacks until DraftClose). Generous: the sync is
+# normally forwarded within one loop cycle.
+EVENTED_COMMIT_LEDGER_WAIT_S = 2.0
+
+
+class EventedVerifyCommits(msgspec.Struct):
+    """One decode round's commits, handed off at launch (the copy_done
+    pattern, symmetric to the drafter's EventedDraftBlock).
+
+    ``result`` is the round's GenerationBatchResult: after its ``copy_done``
+    event fires, ``next_token_ids`` / ``accept_lens`` are pinned-CPU tensors
+    and row i's accepted run is next_token_ids[i*stride : i*stride+accept[i]]
+    -- the exact tokens the batch-result processor appends to output_ids, so
+    the wire stream and the scheduler's bookkeeping stay in agreement.
+    """
+
+    result: Any  # GenerationBatchResult (copy_done / next_token_ids / accept_lens)
+    rids: list[str]
+    pool_indices: list[int]
+    submitted_ts: float
+
 
 class VerifierIpcThread:
     """Verifier-side IPC thread (recv daemon) for decoupled enumeration spec.
@@ -55,6 +83,8 @@ class VerifierIpcThread:
         transport: BaseDecoupledSpecTransport,
         enum_buffer: DecoupledEnumBuffer,
         on_land: Optional[Callable[[DraftEnumerationBufferBatch], None]] = None,
+        num_drafters: int = 1,
+        src_verifier_rank: int = 0,
     ) -> None:
         self.transport = transport
         # The GPU landing buffer. land() holds verifier_rank and rejects a block
@@ -65,6 +95,20 @@ class VerifierIpcThread:
         # the verify manager mirrors arrival stamps here for the sync-mode gate.
         self._on_land = on_land
         self._send_queue: queue.SimpleQueue[DraftControlBatch] = queue.SimpleQueue()
+        # Evented commits (copy_done pattern): handoff queue plus the
+        # thread-local FIFO whose head gates on its round's copy_done event --
+        # head-first keeps a request's commits in round order on the wire.
+        self._evented_queue: queue.SimpleQueue[EventedVerifyCommits] = (
+            queue.SimpleQueue()
+        )
+        self._evented_fifo: deque[EventedVerifyCommits] = deque()
+        # Wire-view ledger of each request's committed total: seeded when this
+        # thread forwards the request's DraftSync, advanced by every commit it
+        # builds, retired by DraftClose. Owning it here (not mirroring the
+        # scheduler's) keeps the wire stream self-consistent by construction.
+        self._sent_committed_lens: dict[str, int] = {}
+        self.num_drafters = max(1, int(num_drafters))
+        self.src_verifier_rank = int(src_verifier_rank)
         self._closed = threading.Event()
         self._thread = threading.Thread(
             target=self._run,
@@ -93,12 +137,21 @@ class VerifierIpcThread:
         # table (assign / remove) and committed length, not on this thread.
         self._send_queue.put(batch)
 
+    def submit_evented_commits(self, pending: EventedVerifyCommits) -> None:
+        if not pending.rids:
+            return
+        self._evented_queue.put(pending)
+
     def _step(self) -> bool:
-        """Run one drain cycle (outgoing controls + incoming tail tokens).
+        """Run one drain cycle (outgoing controls + evented commits + incoming
+        blocks). Controls drain FIRST so a request's DraftSync always hits the
+        wire before the commits of its first round (whose copy_done fires at
+        least a verify round later anyway).
 
         Returns whether any work was done. Safe to call directly from tests.
         """
         did_work = self._drain_send_queue()
+        did_work = self._drain_evented_commits() or did_work
         did_work = self._drain_incoming() or did_work
         return did_work
 
@@ -125,11 +178,81 @@ class VerifierIpcThread:
             except queue.Empty:
                 break
             did_work = True
+            # The ledger follows the wire: a DraftSync (re-)roots the
+            # request's committed-output total, a DraftClose retires it.
+            for sync in batch.sync_messages:
+                self._sent_committed_lens[sync.request_id] = len(sync.committed_outputs)
+            for close in batch.close_messages:
+                self._sent_committed_lens.pop(close.request_id, None)
             self.transport.send(
                 int(batch.dst_drafter_rank),
                 DraftMeshMessage.from_control_batch(batch),
             )
         return did_work
+
+    def _drain_evented_commits(self) -> bool:
+        # Complete every FIFO-head round whose copy_done fired: slice the
+        # accepted runs from the pinned result tensors, build VerifyCommits,
+        # send. Head-first keeps a request's commits in round order.
+        did_work = False
+        while True:
+            try:
+                self._evented_fifo.append(self._evented_queue.get_nowait())
+                did_work = True
+            except queue.Empty:
+                break
+        while self._evented_fifo:
+            head = self._evented_fifo[0]
+            copy_done = head.result.copy_done
+            if copy_done is None or not copy_done.query():
+                break
+            missing = [rid for rid in head.rids if rid not in self._sent_committed_lens]
+            if missing:
+                # The round outran its DraftSync (still queued behind us) --
+                # retry briefly; past the window, poisoned rids simply send no
+                # further commits (their seats ride fallbacks until close).
+                if time.monotonic() - head.submitted_ts < EVENTED_COMMIT_LEDGER_WAIT_S:
+                    break
+                logger.warning(
+                    "evented commits dropped for unseeded requests %s "
+                    "(DraftSync never passed this thread)",
+                    missing[:4],
+                )
+            self._evented_fifo.popleft()
+            self._send_round_commits(head)
+            did_work = True
+        return did_work
+
+    def _send_round_commits(self, pending: EventedVerifyCommits) -> None:
+        result = pending.result
+        next_token_ids = result.next_token_ids.tolist()
+        accept_lens = result.accept_lens.tolist()
+        stride = int(result.speculative_num_draft_tokens)
+        control_batches: dict[int, DraftControlBatch] = {}
+        for i, (rid, pool_idx) in enumerate(zip(pending.rids, pending.pool_indices)):
+            pre_len = self._sent_committed_lens.get(rid)
+            if pre_len is None:
+                continue
+            tokens = next_token_ids[i * stride : i * stride + int(accept_lens[i])]
+            if not tokens:
+                continue
+            rank = int(pool_idx) % self.num_drafters
+            batch = control_batches.get(rank)
+            if batch is None:
+                batch = DraftControlBatch(dst_drafter_rank=rank)
+                control_batches[rank] = batch
+            batch.verify_commit_messages.append(
+                VerifyCommit(
+                    request_id=rid,
+                    src_verifier_rank=self.src_verifier_rank,
+                    dst_drafter_rank=rank,
+                    pre_verify_committed_len=pre_len,
+                    committed_tokens=[int(token) for token in tokens],
+                )
+            )
+            self._sent_committed_lens[rid] = pre_len + len(tokens)
+        for rank, batch in control_batches.items():
+            self.transport.send(rank, DraftMeshMessage.from_control_batch(batch))
 
     def _drain_incoming(self) -> bool:
         # drafter -> verifier enumeration buffer blocks

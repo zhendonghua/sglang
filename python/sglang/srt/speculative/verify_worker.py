@@ -32,7 +32,7 @@ from __future__ import annotations
 import logging
 from collections import deque
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import torch
 
@@ -233,6 +233,11 @@ class VerifyWorker(BaseVerifyWorker):
         # batch at decode-launch, before the select gather, to (boundedly)
         # wait for the enumeration blocks the select is about to read.
         self.select_gate: Optional[Callable[[ScheduleBatch], None]] = None
+        # Commit relay, injected by DecoupledVerifyManager: hands each decode
+        # round's (batch, result) to the IPC thread at launch; the thread
+        # builds and sends the VerifyCommits once the result's copy_done event
+        # fires -- forward end + copy, independent of the scheduler thread.
+        self.commit_relay: Optional[Callable[[ScheduleBatch, Any], None]] = None
 
     def alloc_memory_pool(
         self,
@@ -268,6 +273,8 @@ class VerifyWorker(BaseVerifyWorker):
         batch_output = self._verify(batch)
         if on_publish is not None:
             on_publish(batch_output.new_seq_lens)
+        if self.commit_relay is not None and not batch.forward_mode.is_idle():
+            self.commit_relay(batch, batch_output)
         return batch_output
 
     def _forward_target_prefill(
