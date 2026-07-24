@@ -92,8 +92,12 @@ class EnumArrivalBoard:
         """
 
         def _arrived() -> bool:
+            # ">=", not "==": stamps advance monotonically per seat, and a
+            # commit merge on the drafter can skip a generation entirely --
+            # once the seat moved PAST the expected stamp, waiting longer can
+            # never help (the select falls back either way).
             return all(
-                self._stamps.get(pool_idx) == stamp
+                self._stamps.get(pool_idx, -1) >= stamp
                 for pool_idx, stamp in expected.items()
             )
 
