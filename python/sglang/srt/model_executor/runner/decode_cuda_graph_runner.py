@@ -198,6 +198,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     ):
         super().__init__(model_runner)
         # --- core state ------------------------------------------------
+        # See publish_read_done in replay(): EAGLE-family verify takes the WAR
+        # fast path only for topk == 1 chains.
+        self._war_read_done_topk1_verify = (
+            model_runner.spec_algorithm.is_eagle()
+            or model_runner.spec_algorithm.is_eagle3()
+            or model_runner.spec_algorithm.is_standalone()
+        ) and model_runner.server_args.speculative_eagle_topk == 1
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
@@ -1226,9 +1233,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # Publish a read-done event for the WAR barrier: a cuda-graph forward
         # finishes its shared req_to_token / SWA reads at this pre-replay
         # snapshot, so plain DECODE and block-draft TARGET_VERIFY qualify.
+        # EAGLE-family verify qualifies only at topk == 1 (linear chains, the
+        # decoupled verifier's pinned shape): its pool reads are all staged
+        # into the replay metadata like dflash's, while topk > 1 tree paths
+        # re-read the pool later and must keep the coarse wait_stream.
         publish_read_done = forward_batch.forward_mode.is_decode() or (
             forward_batch.forward_mode.is_target_verify()
-            and self.model_runner.spec_algorithm.is_dflash_family()
+            and (
+                self.model_runner.spec_algorithm.is_dflash_family()
+                or self._war_read_done_topk1_verify
+            )
         )
         # Exception: breakable-graph verify replays (captured forward metadata)
         # re-read req_to_token *during* replay, so the pre-replay snapshot is
