@@ -352,7 +352,7 @@ def _legacy_launcher(*, plan, scratch, prepared, w13, s13, w2, s2, ones, swiglu_
     if w2_alphas is None:
         w2_alphas = ones
 
-    def launch(a, topk_ids, topk_weights, out):
+    def _launch_one(a, topk_ids, topk_weights, out):
         b12x_moe_fp4(
             binding=plan.bind(
                 scratch=scratch,
@@ -376,6 +376,30 @@ def _legacy_launcher(*, plan, scratch, prepared, w13, s13, w2, s2, ones, swiglu_
                 swiglu_limit=swiglu_limit,
             )
         )
+
+    def launch(a, topk_ids, topk_weights, out):
+        """Cap tokens per b12x call.
+
+        The scratch arena is planned for ``SGLANG_B12X_MAX_TOKENS`` and grows
+        linearly with it, so tying that to the prefill chunk makes chunk size a
+        memory knob. MoE is row-independent -- a token's output depends only on
+        its own routed experts -- so slicing rows is numerically exact, which is
+        what makes it safe to lower ``SGLANG_B12X_MAX_TOKENS`` to this cap.
+        Nothing here reads the cap when planning: the two must be set together.
+
+        The cap must also stay above the largest count a decode graph can
+        present (batch size x speculative draft tokens): b12x cannot compile
+        during capture, and a split remainder is not one of the warmed
+        ``core_token_counts``.
+        """
+        split = envs.SGLANG_B12X_SPLIT_TOKENS.get()
+        n = a.shape[0]
+        if split <= 0 or n <= split:
+            _launch_one(a, topk_ids, topk_weights, out)
+            return
+        for i in range(0, n, split):
+            j = min(i + split, n)
+            _launch_one(a[i:j], topk_ids[i:j], topk_weights[i:j], out[i:j])
 
     return launch
 

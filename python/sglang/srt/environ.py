@@ -1529,8 +1529,14 @@ class Envs:
     # b12x MoE runner backend (SM12x / GB10)
     # ==================================================================
     # Upper bound on tokens in one b12x MoE call, used to size its scratch
-    # workspace at load time. Track --chunked-prefill-size if that is raised.
+    # workspace at load time. Must cover the largest call the runner makes:
+    # --chunked-prefill-size, or SGLANG_B12X_SPLIT_TOKENS when that is set.
     SGLANG_B12X_MAX_TOKENS = EnvInt(4096)
+    # Cap tokens per b12x MoE call, so SGLANG_B12X_MAX_TOKENS can be set to this
+    # instead of to --chunked-prefill-size. Nothing couples them: set both.
+    # 0.15.3 launcher path only -- 1.2.2 binds fused_moe directly and ignores
+    # it. 0 = off, one call per batch.
+    SGLANG_B12X_SPLIT_TOKENS = EnvInt(0)
     # Drop b12x's one-CTA-per-SM pin for moe_block_size==8. Measured a 4.4%
     # regression on GB10, so off: the pin suits the kernel it ships with.
     SGLANG_B12X_RELAX_BLOCKS_PER_SM = EnvBool(False)
