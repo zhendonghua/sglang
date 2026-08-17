@@ -59,6 +59,13 @@ _B12X_SCRATCH: dict = {}
 # for the whole model instead of once per layer.
 _B12X_WEIGHT_PLANS: dict = {}
 
+# Same contract as _B12X_SCRATCH above, for the 0.15.3 (legacy) path. That path
+# builds its plan straight from the layer shapes; without this cache every
+# expert layer allocates its own arena -- 46 identical buffers on
+# DeepSeek-V4-Flash. The arena is pure scratch and the layers run
+# sequentially, so one copy is enough.
+_B12X_LEGACY_PLANS: dict = {}
+
 
 def _select_b12x_distribution() -> None:
     """Put the pinned b12x on sys.path ahead of whatever pip installed.
@@ -264,6 +271,40 @@ def _legacy_prepare(*, w13, s13, w2, s2, ones):
         prepare_w4a16=True,
         reuse_input_storage=True,
     )
+
+
+def _get_legacy_plan(
+    *, num_experts, hidden_size, intermediate, top_k, device, swiglu_limit, counts
+):
+    """Plan + arena shared by every expert layer of the same shape."""
+    key = (
+        int(num_experts),
+        int(hidden_size),
+        int(intermediate),
+        int(top_k),
+        str(device),
+        float(swiglu_limit),
+        tuple(counts),
+    )
+    entry = _B12X_LEGACY_PLANS.get(key)
+    if entry is None:
+        entry = _legacy_plan(
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate=intermediate,
+            top_k=top_k,
+            device=device,
+            swiglu_limit=swiglu_limit,
+            counts=counts,
+        )
+        _B12X_LEGACY_PLANS[key] = entry
+        log_info_on_rank0(
+            logger,
+            f"b12x 0.15.3 scratch arena allocated: "
+            f"{entry[1].numel() / 2**20:.0f} MiB "
+            f"(shared by every expert layer of this shape)",
+        )
+    return entry
 
 
 def _legacy_plan(
@@ -523,14 +564,15 @@ class Mxfp4B12xMoEMethod:
         if _b12x_is_legacy():
             # 0.15.3: one call prepares the weights in place, and the scratch
             # plan is built straight from the shapes -- there is no separate
-            # weight plan to share between layers.
+            # weight plan, so the plan and its arena are what get shared between
+            # layers (see _get_legacy_plan).
             w13 = layer.w13_weight.data.view(torch.uint8)
             s13 = layer.w13_weight_scale_inv.data.view(torch.uint8)
             w2 = layer.w2_weight.data.view(torch.uint8)
             s2 = layer.w2_weight_scale_inv.data.view(torch.uint8)
             prepared = _legacy_prepare(w13=w13, s13=s13, w2=w2, s2=s2, ones=ones)
             counts = _core_token_counts(_b12x_max_tokens(), spec_tokens)
-            plan, scratch = _legacy_plan(
+            plan, scratch = _get_legacy_plan(
                 num_experts=num_experts,
                 hidden_size=hidden_size,
                 intermediate=intermediate,
